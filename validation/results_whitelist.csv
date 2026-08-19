@@ -1,0 +1,7 @@
+tutorial,function,tier,metric,value,threshold,pass
+whitelist,knee_estimate_distance,1,mismatched_distributions,0,0,true
+whitelist,knee_estimate_density,2,mismatched_distributions,0,0,true
+whitelist,getErrorCorrectMapping,1,mismatched_distributions,0,0,true
+whitelist,checkError,1,mismatches,0,0,true
+whitelist,getUserDefinedBarcodes,1,mismatches,0,0,true
+whitelist,errorDetectAboveThreshold,1,mismatched_distributions,0,0,true

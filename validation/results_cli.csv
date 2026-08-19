@@ -1,0 +1,5 @@
+tutorial,function,tier,metric,value,threshold,pass
+cli,cli_cases,1,identical_outputs,66,66,true
+cli,cli_cases,1,differing_outputs,0,0,true
+cli,cli_cases,1,unexpected_exit_code_differences,0,0,true
+cli,cli_cases,1,blocked_by_documented_gap,3,3,true

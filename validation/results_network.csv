@@ -1,0 +1,11 @@
+tutorial,function,tier,metric,value,threshold,pass
+network,edit_distance,1,mismatches,0,0,true
+network,edit_distance/unequal_lengths,1,is_none,1,1,true
+network,get_adj_list[adjacency],1,mismatched_positions,0,0,true
+network,get_adj_list[directional],1,mismatched_positions,0,0,true
+network,UMIClusterer[unique],1,mismatched_positions,0,0,true
+network,UMIClusterer[percentile],1,mismatched_positions,0,0,true
+network,UMIClusterer[cluster],1,mismatched_positions,0,0,true
+network,UMIClusterer[adjacency],1,mismatched_positions,0,0,true
+network,UMIClusterer[directional],1,mismatched_positions,0,0,true
+network,get_average_umi_distance,1,max_abs_diff,0.000000,1e-09,true

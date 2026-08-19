@@ -1,0 +1,34 @@
+[package]
+name = "umi_tools-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pure-Rust core of the UMI-tools port: UMI clustering, barcode extraction, whitelisting and read bundling"
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+exclude = ["tests/fixtures/**"]
+
+[lib]
+name = "umi_tools_core"
+
+[dependencies]
+thiserror.workspace = true
+regex.workspace = true
+flate2.workspace = true
+itertools.workspace = true
+rand.workspace = true
+tempfile.workspace = true
+uuid.workspace = true
+noodles-core.workspace = true
+noodles-sam.workspace = true
+noodles-bam.workspace = true
+noodles-cram.workspace = true
+noodles-bgzf.workspace = true
+noodles-fasta.workspace = true
+
+[dev-dependencies]
+serde.workspace = true
+serde_json.workspace = true

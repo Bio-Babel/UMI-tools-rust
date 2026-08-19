@@ -1,0 +1,18 @@
+[package]
+name = "umi_tools_rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Python bindings for the UMI-tools Rust port"
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "umi_tools_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Dependency-table keys must match the path dependency's actual (hyphenated)
+# package name; Cargo does not accept the underscored module form here.
+umi_tools-core = { path = "../core" }
+pyo3 = { version = "0.29", features = ["extension-module"] }

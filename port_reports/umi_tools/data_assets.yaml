@@ -1,0 +1,11 @@
+# Remote data assets for data_registry.py stage/upload/generate.
+# Add one entry per remote-distribution asset identified in Step 4.
+# Required fields: filename, source, distribution, role.
+#
+# Example:
+#   - filename: weights.parquet
+#     source: port_reports/umi_tools/data_exports/weights.parquet
+#     distribution: remote
+#     role: runtime_semantic
+
+assets: []

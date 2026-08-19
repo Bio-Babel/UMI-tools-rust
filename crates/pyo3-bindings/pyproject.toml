@@ -1,0 +1,34 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "umi_tools_rs"
+requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+dynamic = ["version"]
+
+[tool.maturin]
+# Builds the extension module as `umi_tools._native`, matching the
+# differential-testing convention in
+# references/differential-testing-and-validation.md (the Rust
+# implementation is imported as an accelerated submodule of the still-
+# installed original Python package, not as a separate top-level package).
+#
+# `python-source` is REQUIRED for a dotted `module-name` to work at all.
+# Confirmed against a real build: without it (a "pure Rust" maturin
+# layout), maturin silently drops the `umi_tools.` prefix and
+# installs a flat top-level `_native` package instead — no error, no
+# warning, just the wrong layout. `python-source = "python"` opts into
+# maturin's "mixed Rust/Python project" mode, which requires (and this
+# scaffold provides) a real `python/umi_tools/__init__.py` on disk
+# for maturin to build the extension into. See
+# `references/ffi-and-incremental-migration.md` § maturin mixed-layout
+# requirement for the full explanation and how to point this at your
+# *actual* existing Python package instead of the placeholder below.
+python-source = "python"
+module-name = "umi_tools_rs._native"
+features = ["pyo3/extension-module"]

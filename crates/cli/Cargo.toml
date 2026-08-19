@@ -1,0 +1,31 @@
+[package]
+name = "umi_tools-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Command-line interface for the UMI-tools Rust port"
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+
+[lib]
+name = "umi_tools_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "umi_tools"
+path = "src/main.rs"
+
+[dependencies]
+umi_tools-core.workspace = true
+clap.workspace = true
+noodles-core.workspace = true
+noodles-sam.workspace = true
+noodles-bam.workspace = true
+noodles-cram.workspace = true
+regex.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

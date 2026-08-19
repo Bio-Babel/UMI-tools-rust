@@ -1,0 +1,1256 @@
+//! Reading UMIs and cell barcodes out of alignment records, and the
+//! coordinate arithmetic that groups them
+//! (Python source: `umi_tools/sam_methods.py`).
+//!
+//! `umi_tools` accepts the barcode in three places, selected by
+//! `--extract-umi-method`: appended to the read name by `umi_tools extract`,
+//! in a SAM tag written by an aligner or a 10x pipeline, or in the
+//! `umis`-style `:UMI_<seq>:` read-name convention.
+//!
+//! The Python original uses `pysam`; this module uses `noodles`, whose
+//! `RecordBuf` is the domain-standard owned SAM/BAM/CRAM record. The accessor
+//! mapping is tabulated in `port_reports/umi_tools/07_translation_log.md`.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::BufRead;
+use std::path::Path;
+
+use noodles_sam::alignment::record::cigar::op::Kind;
+use noodles_sam::alignment::record::data::field::Tag;
+use noodles_sam::alignment::record_buf::data::field::Value;
+use noodles_sam::alignment::RecordBuf;
+
+use crate::error::{PortError, Result};
+use crate::utilities;
+
+/// The raw mapping quality byte, as `pysam`'s `read.mapping_quality` reports it.
+///
+/// `noodles` models the SAM specification's "mapping quality is not available"
+/// sentinel (255) as `None`, which is the more honest type — but `pysam`
+/// returns the raw byte, and `umi_tools` compares it numerically against
+/// `--mapping-quality` and against other reads' values. Mapping `None` back to
+/// 255 is what keeps those comparisons equivalent.
+///
+/// This is not a hypothetical: every read in the package's own `chr19.bam`
+/// fixture carries MAPQ 255, so treating `None` as 0 makes
+/// `--mapping-quality=20` discard the entire file. Caught by the differential
+/// test against the Python oracle, not by reading the source.
+///
+/// # Examples
+///
+/// ```
+/// use noodles_sam::alignment::RecordBuf;
+/// use umi_tools_core::sam::raw_mapping_quality;
+/// // A record with no mapping quality set reads back as 255, not 0.
+/// assert_eq!(raw_mapping_quality(&RecordBuf::default()), 255);
+/// ```
+#[must_use]
+pub fn raw_mapping_quality(record: &RecordBuf) -> u8 {
+    record.mapping_quality().map_or(255, u8::from)
+}
+
+/// A UMI and, optionally, the cell barcode it was found with
+/// (Python source: the `(umi, cell)` tuple every barcode getter returns).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub struct Barcode {
+    /// The UMI.
+    pub umi: Vec<u8>,
+    /// The cell barcode, absent unless `--per-cell` was requested.
+    pub cell: Option<Vec<u8>>,
+}
+
+/// Extracts the barcode from a read name written by `umi_tools extract`
+/// (Python source: `sam_methods.get_barcode_read_id`).
+///
+/// The UMI is the last `sep`-delimited field of the read name and, with
+/// `cell_barcode`, the cell barcode is the second-to-last — the layout
+/// [`crate::extract::add_barcodes_to_identifier`] writes.
+///
+/// # Errors
+///
+/// Returns [`PortError::Value`] when the name has too few fields, with
+/// Python's message. Python wraps the whole body in a bare `except:` and
+/// re-raises `ValueError`, so *any* failure surfaces the same way.
+///
+/// # Examples
+///
+/// ```
+/// use umi_tools_core::sam::get_barcode_read_id;
+/// let bc = get_barcode_read_id("read1_ACGT", false, "_")?;
+/// assert_eq!(bc.umi, b"ACGT");
+/// assert!(bc.cell.is_none());
+///
+/// let bc = get_barcode_read_id("read1_CELL_ACGT", true, "_")?;
+/// assert_eq!(bc.cell.as_deref(), Some(&b"CELL"[..]));
+/// # Ok::<(), umi_tools_core::PortError>(())
+/// ```
+pub fn get_barcode_read_id(read_name: &str, cell_barcode: bool, sep: &str) -> Result<Barcode> {
+    let fields: Vec<&str> = read_name.split(sep).collect();
+    let bad = || {
+        PortError::value(
+            "Could not extract UMI +/- cell barcode from the read\
+             ID, please check UMI is encoded in the read name",
+        )
+    };
+    let umi = fields.last().ok_or_else(bad)?.as_bytes().to_vec();
+    let cell = if cell_barcode {
+        let n = fields.len();
+        if n < 2 {
+            return Err(bad());
+        }
+        Some(fields[n - 2].as_bytes().to_vec())
+    } else {
+        None
+    };
+    Ok(Barcode { umi, cell })
+}
+
+/// How the barcode tags should be read
+/// (Python source: the eight keyword parameters of `get_barcode_tag`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagConfig {
+    /// Also read a cell barcode.
+    pub cell_barcode: bool,
+    /// The two-character tag holding the UMI (`--umi-tag`, default `RX`).
+    pub umi_tag: [u8; 2],
+    /// The tag holding the cell barcode (`--cell-tag`).
+    pub cell_tag: Option<[u8; 2]>,
+    /// Keep only the part of the UMI before this separator.
+    pub umi_tag_split: Option<String>,
+    /// Remove every occurrence of this delimiter from the UMI.
+    pub umi_tag_delim: Option<String>,
+    /// Keep only the part of the cell barcode before this separator.
+    ///
+    /// Defaults to `-`, because 10x pipelines append a GEM well suffix
+    /// (`GATAGATACCTAGATA-1`) that is not part of the barcode.
+    pub cell_tag_split: Option<String>,
+    /// Remove every occurrence of this delimiter from the cell barcode.
+    pub cell_tag_delim: Option<String>,
+}
+
+impl Default for TagConfig {
+    /// Python's defaults: `umi_tag='RX'`, `cell_tag_split="-"`, the rest unset.
+    fn default() -> Self {
+        Self {
+            cell_barcode: false,
+            umi_tag: *b"RX",
+            cell_tag: None,
+            umi_tag_split: None,
+            umi_tag_delim: None,
+            cell_tag_split: Some("-".to_string()),
+            cell_tag_delim: None,
+        }
+    }
+}
+
+/// Reads a SAM tag as text, whatever scalar type it was stored as
+/// (Python source: `pysam`'s `read.get_tag`, which likewise coerces).
+///
+/// Returns `None` when the tag is absent or holds an array, which has no
+/// single textual value.
+#[must_use]
+pub fn tag_text(record: &RecordBuf, tag: [u8; 2]) -> Option<String> {
+    match record.data().get(&Tag::from(tag))? {
+        Value::String(s) | Value::Hex(s) => Some(String::from_utf8_lossy(s.as_ref()).into_owned()),
+        Value::Character(c) => Some((*c as char).to_string()),
+        Value::Int8(v) => Some(v.to_string()),
+        Value::UInt8(v) => Some(v.to_string()),
+        Value::Int16(v) => Some(v.to_string()),
+        Value::UInt16(v) => Some(v.to_string()),
+        Value::Int32(v) => Some(v.to_string()),
+        Value::UInt32(v) => Some(v.to_string()),
+        Value::Float(v) => Some(v.to_string()),
+        Value::Array(_) => None,
+    }
+}
+
+fn apply_split_and_delim(value: String, split: Option<&String>, delim: Option<&String>) -> String {
+    let mut value = value;
+    if let Some(sep) = split {
+        if !sep.is_empty() {
+            value = value.split(sep.as_str()).next().unwrap_or("").to_string();
+        }
+    }
+    if let Some(d) = delim {
+        if !d.is_empty() {
+            value = value.split(d.as_str()).collect::<Vec<_>>().concat();
+        }
+    }
+    value
+}
+
+/// Extracts the barcode from SAM tags
+/// (Python source: `sam_methods.get_barcode_tag`).
+///
+/// The split and delimiter post-processing runs in Python's order: split
+/// first, then delimiter removal. The cell barcode's split defaults to `-`
+/// because 10x appends a GEM well number to it.
+///
+/// # Errors
+///
+/// Returns [`PortError::Value`] when a required tag is missing, matching
+/// Python, whose `read.get_tag` raises `KeyError` — which the callers in
+/// [`crate::bundles`] catch to count "Read skipped, missing umi and/or cell
+/// tag", exactly as Python does.
+pub fn get_barcode_tag(record: &RecordBuf, config: &TagConfig) -> Result<Barcode> {
+    let missing = |what: &str| {
+        PortError::value(format!(
+            "Could not extract UMI +/- cell barcode from the read tag: {what} not present"
+        ))
+    };
+
+    let raw_umi = tag_text(record, config.umi_tag)
+        .ok_or_else(|| missing(&String::from_utf8_lossy(&config.umi_tag)))?;
+    let umi = apply_split_and_delim(
+        raw_umi,
+        config.umi_tag_split.as_ref(),
+        config.umi_tag_delim.as_ref(),
+    );
+
+    let cell = if config.cell_barcode {
+        let cell_tag = config
+            .cell_tag
+            .ok_or_else(|| PortError::value("Need to supply the --cell-tag option"))?;
+        let raw = tag_text(record, cell_tag)
+            .ok_or_else(|| missing(&String::from_utf8_lossy(&cell_tag)))?;
+        // Python guards the post-processing with `if cell and ...`, so an
+        // empty cell barcode is passed through untouched.
+        let processed = if raw.is_empty() {
+            raw
+        } else {
+            apply_split_and_delim(
+                raw,
+                config.cell_tag_split.as_ref(),
+                config.cell_tag_delim.as_ref(),
+            )
+        };
+        // Python's `if cell:` before `.encode()` means an empty barcode stays
+        // `""`, which is falsy and therefore never encoded — it reaches the
+        // caller as the empty string, not as None.
+        Some(processed.into_bytes())
+    } else {
+        None
+    };
+
+    Ok(Barcode {
+        umi: umi.into_bytes(),
+        cell,
+    })
+}
+
+/// Extracts the UMI from a read name, ignoring any cell barcode
+/// (Python source: `sam_methods.get_umi_read_string`).
+///
+/// Used by `count_tab`, whose input is a flat file of read identifiers rather
+/// than an alignment.
+///
+/// # Errors
+///
+/// Returns [`PortError::Value`] when the name has no fields at all.
+pub fn get_umi_read_string(read_id: &str, sep: &str) -> Result<Barcode> {
+    let umi = read_id
+        .split(sep)
+        .last()
+        .ok_or_else(|| {
+            PortError::value(
+                "Could not extract UMI from the read ID, please\
+                 check UMI is encoded in the read name",
+            )
+        })?
+        .as_bytes()
+        .to_vec();
+    Ok(Barcode { umi, cell: None })
+}
+
+/// Extracts the cell barcode and UMI from a read name
+/// (Python source: `sam_methods.get_cell_umi_read_string`).
+///
+/// # Errors
+///
+/// Returns [`PortError::Value`] when the name has fewer than two fields, with
+/// Python's message including the offending read ID.
+pub fn get_cell_umi_read_string(read_id: &str, sep: &str) -> Result<Barcode> {
+    let fields: Vec<&str> = read_id.split(sep).collect();
+    if fields.len() < 2 {
+        return Err(PortError::value(format!(
+            "Could not extract UMI or CB from the read ID, please\
+             check UMI and CB are encoded in the read name:{read_id}"
+        )));
+    }
+    Ok(Barcode {
+        umi: fields[fields.len() - 1].as_bytes().to_vec(),
+        cell: Some(fields[fields.len() - 2].as_bytes().to_vec()),
+    })
+}
+
+/// Extracts the barcode from a `umis`-style read name
+/// (Python source: `sam_methods.get_barcode_umis`).
+///
+/// The `umis` toolkit writes `:UMI_<seq>:` and `:CELL_<seq>:` fields into the
+/// read name; this scans the colon-separated fields for those prefixes.
+///
+/// # Errors
+///
+/// Returns [`PortError::Value`] when no `UMI_` field is present, matching
+/// Python, which raises a bare `ValueError()` and catches it into the same
+/// message.
+pub fn get_barcode_umis(read_name: &str, cell_barcode: bool) -> Result<Barcode> {
+    let mut umi = None;
+    let mut cell = None;
+    for element in read_name.split(':') {
+        if let Some(rest) = element.strip_prefix("UMI_") {
+            umi = Some(rest.as_bytes().to_vec());
+        } else if cell_barcode {
+            if let Some(rest) = element.strip_prefix("CELL_") {
+                cell = Some(rest.as_bytes().to_vec());
+            }
+        }
+    }
+    let umi = umi.ok_or_else(|| {
+        PortError::value("Could not extract UMI +/- cell barcode from the read tag")
+    })?;
+    Ok(Barcode { umi, cell })
+}
+
+/// How a barcode should be read out of a record
+/// (Python source: the `functools.partial` bound to
+/// `get_bundles.barcode_getter`, selected by `--extract-umi-method`).
+///
+/// Python stores a partially-applied function; an enum makes the three
+/// possibilities explicit and keeps the type concrete, which a `Box<dyn Fn>`
+/// would not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BarcodeGetter {
+    /// The barcode is appended to the read name.
+    ReadId {
+        /// Also read a cell barcode.
+        cell_barcode: bool,
+        /// The field separator (`--umi-separator`).
+        sep: String,
+    },
+    /// The barcode is in SAM tags.
+    Tag(TagConfig),
+    /// The read name follows the `umis` toolkit's convention.
+    Umis {
+        /// Also read a cell barcode.
+        cell_barcode: bool,
+    },
+}
+
+impl BarcodeGetter {
+    /// Reads the barcode out of `record`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the underlying getter's errors.
+    pub fn get(&self, record: &RecordBuf) -> Result<Barcode> {
+        let name = record
+            .name()
+            .map(|n| String::from_utf8_lossy(n.as_ref()).into_owned())
+            .unwrap_or_default();
+        match self {
+            BarcodeGetter::ReadId { cell_barcode, sep } => {
+                get_barcode_read_id(&name, *cell_barcode, sep)
+            }
+            BarcodeGetter::Tag(config) => get_barcode_tag(record, config),
+            BarcodeGetter::Umis { cell_barcode } => get_barcode_umis(&name, *cell_barcode),
+        }
+    }
+}
+
+/// Which barcode fields a `count_tab` input line carries
+/// (Python source: the `bc_getter` partial `count_tab.main` builds).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StringBarcodeGetter {
+    /// `read_id[sep]UMI`.
+    UmiOnly,
+    /// `read_id[sep]CB[sep]UMI`.
+    CellAndUmi,
+}
+
+impl StringBarcodeGetter {
+    /// Reads the barcode out of a read identifier.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`get_umi_read_string`] or [`get_cell_umi_read_string`].
+    pub fn get(self, read_id: &str, sep: &str) -> Result<Barcode> {
+        match self {
+            StringBarcodeGetter::UmiOnly => get_umi_read_string(read_id, sep),
+            StringBarcodeGetter::CellAndUmi => get_cell_umi_read_string(read_id, sep),
+        }
+    }
+}
+
+/// One cell's UMI counts within a gene.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CellEntry {
+    /// The cell barcode, `None` when the input carries none.
+    pub cell: Option<Vec<u8>>,
+    /// The cell's UMIs, in the order they were first seen.
+    pub umis: Vec<Vec<u8>>,
+    /// UMI to read count.
+    pub counts: BTreeMap<Vec<u8>, u64>,
+}
+
+/// A gene's per-cell UMI counts, in the order the cells were first seen
+/// (Python source: the `defaultdict(Counter)` `get_gene_count_tab` yields).
+///
+/// Order is not cosmetic here. `count_tab` writes one row per cell as it goes,
+/// with no final sort, so the row order is the dictionary's insertion order —
+/// and the UMI order within a cell decides the clustering order, which decides
+/// the counts themselves when UMIs tie. A `BTreeMap` alone would silently sort
+/// both, so the insertion order is carried explicitly.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CellUmiCounts {
+    entries: Vec<CellEntry>,
+    index: BTreeMap<Option<Vec<u8>>, usize>,
+}
+
+impl CellUmiCounts {
+    /// Records one observation, creating the cell and UMI entries if new.
+    pub fn observe(&mut self, cell: Option<Vec<u8>>, umi: Vec<u8>) {
+        let position = if let Some(&i) = self.index.get(&cell) {
+            i
+        } else {
+            let i = self.entries.len();
+            self.index.insert(cell.clone(), i);
+            self.entries.push(CellEntry {
+                cell,
+                ..CellEntry::default()
+            });
+            i
+        };
+        let entry = &mut self.entries[position];
+        let slot = entry.counts.entry(umi.clone()).or_insert(0);
+        if *slot == 0 {
+            entry.umis.push(umi);
+        }
+        *slot += 1;
+    }
+
+    /// The cells, in first-seen order.
+    #[must_use]
+    pub fn cells(&self) -> &[CellEntry] {
+        &self.entries
+    }
+
+    /// How many distinct cells were seen.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether no observations were recorded.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// One cell's entry, by barcode.
+    #[must_use]
+    pub fn get(&self, cell: &Option<Vec<u8>>) -> Option<&CellEntry> {
+        self.index.get(cell).map(|&i| &self.entries[i])
+    }
+}
+
+/// Yields per-gene UMI counts from a `count_tab` input stream
+/// (Python source: `sam_methods.get_gene_count_tab`).
+///
+/// The input is a two-column TSV of `read_id<TAB>gene`, **sorted by gene** —
+/// this is a streaming group-by, so an unsorted input silently splits a gene
+/// across several yields, exactly as it does in Python.
+///
+/// # Errors
+///
+/// Each item is a [`Result`]. A line without exactly two tab-separated columns
+/// yields [`PortError::Assertion`] with Python's message; a read identifier
+/// the getter cannot parse yields [`PortError::Value`].
+pub struct GeneCountTab<R: BufRead> {
+    reader: R,
+    getter: StringBarcodeGetter,
+    sep: String,
+    gene: Option<String>,
+    counts: CellUmiCounts,
+    finished: bool,
+}
+
+impl<R: BufRead> GeneCountTab<R> {
+    /// Reads `reader`, parsing barcodes with `getter` and `sep`.
+    pub fn new(reader: R, getter: StringBarcodeGetter, sep: impl Into<String>) -> Self {
+        Self {
+            reader,
+            getter,
+            sep: sep.into(),
+            gene: None,
+            counts: CellUmiCounts::default(),
+            finished: false,
+        }
+    }
+
+    fn next_group(&mut self) -> Result<Option<(String, CellUmiCounts)>> {
+        loop {
+            let mut line = String::new();
+            let n = self
+                .reader
+                .read_line(&mut line)
+                .map_err(|e| PortError::io(Path::new("<count_tab input>"), e))?;
+            if n == 0 {
+                // Python yields the final gene unconditionally after the loop,
+                // even when the file was empty — in which case it yields
+                // `(None, Counter())`. That degenerate yield has no gene to
+                // report, so it is simply the end of the stream here.
+                self.finished = true;
+                return Ok(self
+                    .gene
+                    .take()
+                    .map(|g| (g, std::mem::take(&mut self.counts))));
+            }
+
+            let trimmed = line.trim_end_matches(['\n', '\r']).trim();
+            let values: Vec<&str> = trimmed.split('\t').collect();
+            if values.len() != 2 {
+                return Err(PortError::assertion(format!(
+                    "line: {line} does not contain 2 columns"
+                )));
+            }
+            let (read_id, assigned_gene) = (values[0], values[1]);
+
+            let mut finished_group = None;
+            if self.gene.as_deref() != Some(assigned_gene) {
+                if let Some(previous) = self.gene.take() {
+                    finished_group = Some((previous, std::mem::take(&mut self.counts)));
+                }
+                self.gene = Some(assigned_gene.to_string());
+                self.counts = CellUmiCounts::default();
+            }
+
+            let barcode = self.getter.get(read_id, &self.sep)?;
+            self.counts.observe(barcode.cell, barcode.umi);
+
+            if finished_group.is_some() {
+                return Ok(finished_group);
+            }
+        }
+    }
+}
+
+impl<R: BufRead> Iterator for GeneCountTab<R> {
+    type Item = Result<(String, CellUmiCounts)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished && self.gene.is_none() {
+            return None;
+        }
+        match self.next_group() {
+            Ok(Some(group)) => Some(Ok(group)),
+            Ok(None) => None,
+            Err(e) => {
+                self.finished = true;
+                self.gene = None;
+                Some(Err(e))
+            }
+        }
+    }
+}
+
+/// Gene to the transcripts belonging to it
+/// (Python source: the `defaultdict(set)` `getMetaContig2contig` returns).
+pub type MetaContigMap = BTreeMap<String, BTreeSet<String>>;
+
+/// Reads a gene-to-transcript map, keeping only transcripts present in the
+/// alignment (Python source: `sam_methods.getMetaContig2contig`).
+///
+/// Python takes the whole `AlignmentFile` and reads `bamfile.references` off
+/// it; this takes the reference names directly, so the function has no
+/// dependency on the alignment reader and can be tested without one.
+///
+/// Parsing stops at the first blank line, and `#`-prefixed lines are skipped —
+/// both behaviours are Python's.
+///
+/// # Errors
+///
+/// - [`PortError::Io`] if the file cannot be read.
+/// - [`PortError::Format`] for a line without exactly two tab-separated
+///   columns, where Python raises `ValueError` from tuple unpacking.
+pub fn get_metacontig2contig(references: &BTreeSet<String>, path: &Path) -> Result<MetaContigMap> {
+    let reader = utilities::open_file(path)?;
+    let mut map = MetaContigMap::new();
+    for line in reader.lines() {
+        let line = line.map_err(|e| PortError::io(path, e))?;
+        if line.starts_with('#') {
+            continue;
+        }
+        if line.trim().is_empty() {
+            break;
+        }
+        let fields: Vec<&str> = line.trim_end_matches(['\n', '\r']).split('\t').collect();
+        if fields.len() != 2 {
+            return Err(PortError::format(format!(
+                "{}: expected 2 tab-separated columns, got {}",
+                path.display(),
+                fields.len()
+            )));
+        }
+        let (gene, transcript) = (fields[0], fields[1]);
+        if references.contains(transcript) {
+            map.entry(gene.to_string())
+                .or_default()
+                .insert(transcript.to_string());
+        }
+    }
+    Ok(map)
+}
+
+/// Where a splice begins, as an offset from the alignment start
+/// (Python source: `sam_methods.find_splice`).
+///
+/// A soft clip at the **end** of the read counts as a splice; one at the
+/// start does not, and instead shifts the offset. `None` means no splice was
+/// found, which Python signals by returning `False` — an `int | False` union
+/// that [`Option<usize>`] models exactly.
+///
+/// # Errors
+///
+/// Returns [`PortError::Value`] for an unrecognised CIGAR operation, with
+/// Python's message `"Bad Cigar operation: <op>"`.
+///
+/// # Examples
+///
+/// ```
+/// use noodles_sam::alignment::record::cigar::op::Kind;
+/// use umi_tools_core::sam::find_splice;
+///
+/// // 20M100N30M: the splice starts 20 bases in.
+/// let cigar = [(Kind::Match, 20), (Kind::Skip, 100), (Kind::Match, 30)];
+/// assert_eq!(find_splice(&cigar)?, Some(20));
+///
+/// // 50M: no splice.
+/// assert_eq!(find_splice(&[(Kind::Match, 50)])?, None);
+/// # Ok::<(), umi_tools_core::PortError>(())
+/// ```
+pub fn find_splice(cigar: &[(Kind, usize)]) -> Result<Option<usize>> {
+    let mut offset = 0usize;
+    let mut ops = cigar;
+
+    // A leading soft clip is not a splice; it shifts the coordinate instead.
+    if let Some(&(Kind::SoftClip, len)) = ops.first() {
+        offset = len;
+        ops = &ops[1..];
+    }
+
+    for &(kind, bases) in ops {
+        match kind {
+            // N or S: the splice starts here.
+            Kind::Skip | Kind::SoftClip => return Ok(Some(offset)),
+            // M, D, = or X: reference-consuming.
+            Kind::Match | Kind::Deletion | Kind::SequenceMatch | Kind::SequenceMismatch => {
+                offset += bases;
+            }
+            // I, H, P: not reference-consuming.
+            Kind::Insertion | Kind::HardClip | Kind::Pad => {}
+        }
+    }
+    Ok(None)
+}
+
+/// Where a read starts and where it is grouped
+/// (Python source: the `(start, pos, is_spliced)` tuple `get_read_position`
+/// returns).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadPosition {
+    /// The read's leftmost coordinate, used to decide when a bundle can be
+    /// flushed.
+    pub start: i64,
+    /// The coordinate reads are grouped on: the 5-prime end in read
+    /// orientation, adjusted for soft clipping.
+    pub pos: i64,
+    /// Where the first splice begins, if the read is spliced.
+    pub is_spliced: Option<usize>,
+}
+
+/// Computes a read's grouping coordinate, correcting for soft clipping
+/// (Python source: `sam_methods.get_read_position`).
+///
+/// Deduplication groups reads by their 5-prime end, which is the alignment
+/// start for a forward read and the alignment end for a reverse one.
+/// Soft-clipped bases are added back, so a read whose first bases failed to
+/// align still groups with its untrimmed copies — without that correction,
+/// PCR duplicates differing only in adapter trimming would be counted twice.
+///
+/// # Errors
+///
+/// - [`PortError::Alignment`] for a record with no alignment start or end,
+///   which cannot be positioned; Python would raise `TypeError` on the
+///   arithmetic.
+/// - [`PortError::Value`] from [`find_splice`] for an unrecognised CIGAR
+///   operation.
+pub fn get_read_position(record: &RecordBuf, soft_clip_threshold: usize) -> Result<ReadPosition> {
+    let cigar: Vec<(Kind, usize)> = record
+        .cigar()
+        .as_ref()
+        .iter()
+        .map(|op| (op.kind(), op.len()))
+        .collect();
+    let has_skip = cigar.iter().any(|(k, _)| *k == Kind::Skip);
+
+    let start_pos = record
+        .alignment_start()
+        .ok_or_else(|| PortError::alignment("record has no alignment start"))?;
+    // noodles positions are 1-based; pysam's `.pos`/`.aend` are 0-based, and
+    // every downstream comparison and TSV column uses the pysam convention.
+    let alignment_start = i64::try_from(usize::from(start_pos)).unwrap_or(i64::MAX) - 1;
+
+    if record.flags().is_reverse_complemented() {
+        let end = record
+            .alignment_end()
+            .ok_or_else(|| PortError::alignment("record has no alignment end"))?;
+        let mut pos = i64::try_from(usize::from(end)).unwrap_or(i64::MAX);
+        if let Some(&(Kind::SoftClip, len)) = cigar.last() {
+            pos += i64::try_from(len).unwrap_or(0);
+        }
+        let trailing_clip = matches!(cigar.last(), Some(&(Kind::SoftClip, len))
+            if len > soft_clip_threshold);
+        let is_spliced = if has_skip || trailing_clip {
+            // The 5-prime end of a reverse read is the right-hand end, so the
+            // CIGAR is walked backwards.
+            let reversed: Vec<(Kind, usize)> = cigar.iter().rev().copied().collect();
+            find_splice(&reversed)?
+        } else {
+            None
+        };
+        Ok(ReadPosition {
+            start: alignment_start,
+            pos,
+            is_spliced,
+        })
+    } else {
+        let mut pos = alignment_start;
+        if let Some(&(Kind::SoftClip, len)) = cigar.first() {
+            pos -= i64::try_from(len).unwrap_or(0);
+        }
+        let leading_clip = matches!(cigar.last(), Some(&(Kind::SoftClip, len))
+            if len > soft_clip_threshold);
+        let is_spliced = if has_skip || leading_clip {
+            find_splice(&cigar)?
+        } else {
+            None
+        };
+        Ok(ReadPosition {
+            start: pos,
+            pos,
+            is_spliced,
+        })
+    }
+}
+
+/// Writes a deduplicated alignment together with each retained read's mate
+/// (Python source: `sam_methods.TwoPassPairWriter`).
+///
+/// Deduplication selects read 1s, but a paired-end output is only usable if
+/// each retained read 1 is accompanied by its read 2. Finding that mate by
+/// seeking would be prohibitive, so the original takes two passes: it notes
+/// the mates it still owes, and flushes them whenever the scan moves to a new
+/// contig — by which point every mate on the previous contig has gone by.
+/// Whatever is still owed at the end is found in a final full pass.
+///
+/// # A note on `close`
+///
+/// The Python original warns that "if `close()` is not called, at least a
+/// contig's worth of mates will be missing". Here [`close`](Self::close)
+/// consumes the writer, so forgetting it is a compile error rather than a
+/// silently truncated file.
+pub struct TwoPassPairWriter<'a> {
+    records: &'a [RecordBuf],
+    /// Reference-sequence names indexed by id, in header order.
+    reference_names: Vec<String>,
+    writer: crate::alignment::OpenedAlignmentWriter,
+    /// Mates still owed, keyed as Python keys them.
+    owed: std::collections::BTreeSet<MateKey>,
+    chrom: Option<String>,
+    never_found: usize,
+}
+
+/// `(query name, mate reference, mate position)` — the key Python builds from
+/// `read.query_name, read.next_reference_name, read.next_reference_start`.
+type MateKey = (Vec<u8>, Option<String>, Option<usize>);
+
+impl<'a> TwoPassPairWriter<'a> {
+    /// Creates a writer over `records`, the same records deduplication scanned.
+    ///
+    /// Python opens a second handle on the input file for the mate passes; the
+    /// records are already in memory here, so the second handle is a second
+    /// traversal of the same slice.
+    ///
+    /// `reference_names` are the header's reference-sequence names in id
+    /// order, which is how a record's contig is resolved.
+    #[must_use]
+    pub fn new(
+        records: &'a [RecordBuf],
+        reference_names: Vec<String>,
+        writer: crate::alignment::OpenedAlignmentWriter,
+    ) -> Self {
+        Self {
+            records,
+            reference_names,
+            writer,
+            owed: std::collections::BTreeSet::new(),
+            chrom: None,
+            never_found: 0,
+        }
+    }
+
+    fn name_of(record: &RecordBuf) -> Vec<u8> {
+        record.name().map(|n| n.to_vec()).unwrap_or_default()
+    }
+
+    fn reference_of(&self, record: &RecordBuf) -> Option<String> {
+        record
+            .reference_sequence_id()
+            .and_then(|id| self.reference_names.get(id).cloned())
+    }
+
+    fn mate_reference_of(&self, record: &RecordBuf) -> Option<String> {
+        record
+            .mate_reference_sequence_id()
+            .and_then(|id| self.reference_names.get(id).cloned())
+    }
+
+    /// Writes one read, flushing owed mates when the contig changes
+    /// (Python source: `TwoPassPairWriter.write`).
+    ///
+    /// An unmapped read, or one whose mate is unmapped, is written straight
+    /// through and no mate is owed for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortError::Alignment`] if the record cannot be written.
+    pub fn write(&mut self, record: &RecordBuf, unmapped: bool) -> Result<()> {
+        if unmapped || record.flags().is_mate_unmapped() {
+            return self.writer.write(record);
+        }
+
+        let contig = self.reference_of(record);
+        if self.chrom != contig {
+            self.write_mates()?;
+            self.chrom = contig;
+        }
+
+        self.owed.insert((
+            Self::name_of(record),
+            self.mate_reference_of(record),
+            record.mate_alignment_start().map(usize::from),
+        ));
+        self.writer.write(record)
+    }
+
+    /// Scans the current contig for the mates still owed
+    /// (Python source: `TwoPassPairWriter.write_mates`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortError::Alignment`] if a record cannot be written.
+    pub fn write_mates(&mut self) -> Result<()> {
+        let Some(chrom) = self.chrom.clone() else {
+            return Ok(());
+        };
+        utilities::debug(&format!(
+            "Dumping {} mates for contig {chrom}",
+            self.owed.len()
+        ));
+        self.scan(Some(&chrom))?;
+        utilities::debug(&format!("{} mates remaining", self.owed.len()));
+        Ok(())
+    }
+
+    /// Writes owed mates found among records on `contig`, or among all records
+    /// when `contig` is `None`.
+    fn scan(&mut self, contig: Option<&str>) -> Result<()> {
+        let mut found: Vec<usize> = Vec::new();
+        for (index, record) in self.records.iter().enumerate() {
+            let name = self.reference_of(record);
+            if contig.is_some() && name.as_deref() != contig {
+                continue;
+            }
+            let flags = record.flags();
+            // Python skips unmapped reads, reads whose mate is unmapped, and
+            // read 1s — it is looking for read 2s to pair with retained read 1s.
+            if flags.is_unmapped()
+                || flags.is_mate_unmapped()
+                || (flags.is_segmented() && flags.is_first_segment())
+            {
+                continue;
+            }
+            let key = (
+                Self::name_of(record),
+                name,
+                record.alignment_start().map(usize::from),
+            );
+            if self.owed.remove(&key) {
+                found.push(index);
+            }
+        }
+        for index in found {
+            self.writer.write(&self.records[index])?;
+        }
+        Ok(())
+    }
+
+    /// Flushes the last contig's mates, then searches the whole file for
+    /// whatever is still owed (Python source: `TwoPassPairWriter.close`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortError::Alignment`] if a record cannot be written or the
+    /// file cannot be finalised.
+    pub fn close(mut self) -> Result<()> {
+        self.write_mates()?;
+        utilities::info(&format!(
+            "Searching for mates for {} unmatched alignments",
+            self.owed.len()
+        ));
+        self.scan(None)?;
+        self.never_found = self.owed.len();
+        utilities::info(&format!("{} mates never found", self.never_found));
+        self.writer.finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use noodles_core::Position;
+    use noodles_sam::alignment::record::cigar::Op;
+    use noodles_sam::alignment::record::Flags;
+    use noodles_sam::alignment::record_buf::Cigar as CigarBuf;
+
+    fn record(name: &str) -> RecordBuf {
+        let mut r = RecordBuf::default();
+        *r.name_mut() = Some(name.into());
+        r
+    }
+
+    fn positioned(name: &str, start: usize, ops: &[(Kind, usize)], reverse: bool) -> RecordBuf {
+        let mut r = record(name);
+        *r.alignment_start_mut() = Position::new(start);
+        *r.cigar_mut() = ops
+            .iter()
+            .map(|&(k, n)| Op::new(k, n))
+            .collect::<CigarBuf>();
+        if reverse {
+            *r.flags_mut() = Flags::REVERSE_COMPLEMENTED;
+        }
+        r
+    }
+
+    #[test]
+    fn read_id_barcodes_match_python() {
+        let bc = get_barcode_read_id("read1_ACGT", false, "_").unwrap();
+        assert_eq!(bc.umi, b"ACGT");
+        assert_eq!(bc.cell, None);
+
+        let bc = get_barcode_read_id("read1_CELL_ACGT", true, "_").unwrap();
+        assert_eq!(bc.umi, b"ACGT");
+        assert_eq!(bc.cell.as_deref(), Some(&b"CELL"[..]));
+    }
+
+    #[test]
+    fn read_id_barcodes_honour_the_separator() {
+        let bc = get_barcode_read_id("read1-ACGT", false, "-").unwrap();
+        assert_eq!(bc.umi, b"ACGT");
+        // With the wrong separator the whole name becomes the UMI, exactly as
+        // Python's split does.
+        let bc = get_barcode_read_id("read1-ACGT", false, "_").unwrap();
+        assert_eq!(bc.umi, b"read1-ACGT");
+    }
+
+    #[test]
+    fn read_id_cell_barcode_needs_two_fields() {
+        assert!(get_barcode_read_id("readonly", true, "_").is_err());
+        assert!(get_barcode_read_id("readonly", false, "_").is_ok());
+    }
+
+    #[test]
+    fn umi_read_string_helpers_match_python() {
+        assert_eq!(get_umi_read_string("abc_ACGT", "_").unwrap().umi, b"ACGT");
+        let bc = get_cell_umi_read_string("abc_CELL_ACGT", "_").unwrap();
+        assert_eq!(bc.umi, b"ACGT");
+        assert_eq!(bc.cell.as_deref(), Some(&b"CELL"[..]));
+        assert!(get_cell_umi_read_string("solo", "_").is_err());
+    }
+
+    #[test]
+    fn umis_convention_barcodes() {
+        let bc = get_barcode_umis("READ:UMI_ACGT:CELL_TTTT:1", true).unwrap();
+        assert_eq!(bc.umi, b"ACGT");
+        assert_eq!(bc.cell.as_deref(), Some(&b"TTTT"[..]));
+
+        let bc = get_barcode_umis("READ:UMI_ACGT:CELL_TTTT", false).unwrap();
+        assert_eq!(bc.cell, None);
+
+        assert!(get_barcode_umis("READ:CELL_TTTT", true).is_err());
+    }
+
+    #[test]
+    fn tag_barcodes_apply_split_then_delim() {
+        let mut r = record("read");
+        r.data_mut()
+            .insert(Tag::from(*b"RX"), Value::String("ACGT-1".into()));
+        r.data_mut()
+            .insert(Tag::from(*b"CB"), Value::String("TTTTTT-1".into()));
+
+        let config = TagConfig {
+            cell_barcode: true,
+            cell_tag: Some(*b"CB"),
+            ..TagConfig::default()
+        };
+        let bc = get_barcode_tag(&r, &config).unwrap();
+        // The UMI has no split configured, so the suffix stays.
+        assert_eq!(bc.umi, b"ACGT-1");
+        // The cell barcode splits on the default "-", dropping the GEM well.
+        assert_eq!(bc.cell.as_deref(), Some(&b"TTTTTT"[..]));
+
+        let config = TagConfig {
+            umi_tag_split: Some("-".to_string()),
+            ..config
+        };
+        assert_eq!(get_barcode_tag(&r, &config).unwrap().umi, b"ACGT");
+    }
+
+    #[test]
+    fn tag_delimiter_removes_every_occurrence() {
+        let mut r = record("read");
+        r.data_mut()
+            .insert(Tag::from(*b"RX"), Value::String("AC-GT-TT".into()));
+        let config = TagConfig {
+            umi_tag_delim: Some("-".to_string()),
+            ..TagConfig::default()
+        };
+        assert_eq!(get_barcode_tag(&r, &config).unwrap().umi, b"ACGTTT");
+    }
+
+    #[test]
+    fn missing_tag_is_an_error() {
+        let r = record("read");
+        assert!(get_barcode_tag(&r, &TagConfig::default()).is_err());
+    }
+
+    #[test]
+    fn cell_tag_without_a_tag_name_is_an_error() {
+        let mut r = record("read");
+        r.data_mut()
+            .insert(Tag::from(*b"RX"), Value::String("ACGT".into()));
+        let config = TagConfig {
+            cell_barcode: true,
+            cell_tag: None,
+            ..TagConfig::default()
+        };
+        assert!(get_barcode_tag(&r, &config).is_err());
+    }
+
+    #[test]
+    fn find_splice_matches_python() {
+        assert_eq!(find_splice(&[(Kind::Match, 50)]).unwrap(), None);
+        assert_eq!(
+            find_splice(&[(Kind::SoftClip, 3), (Kind::Match, 47)]).unwrap(),
+            None
+        );
+        assert_eq!(
+            find_splice(&[(Kind::Match, 20), (Kind::Skip, 100), (Kind::Match, 30)]).unwrap(),
+            Some(20)
+        );
+        assert_eq!(
+            find_splice(&[(Kind::Match, 20), (Kind::SoftClip, 10)]).unwrap(),
+            Some(20)
+        );
+        assert_eq!(
+            find_splice(&[(Kind::HardClip, 2), (Kind::Match, 48)]).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn find_splice_leading_clip_shifts_the_offset() {
+        assert_eq!(
+            find_splice(&[(Kind::SoftClip, 5), (Kind::Match, 20), (Kind::Skip, 100)]).unwrap(),
+            Some(25)
+        );
+    }
+
+    #[test]
+    fn find_splice_counts_only_reference_consuming_ops() {
+        assert_eq!(
+            find_splice(&[
+                (Kind::Match, 10),
+                (Kind::Insertion, 5),
+                (Kind::Deletion, 3),
+                (Kind::Skip, 100)
+            ])
+            .unwrap(),
+            Some(13)
+        );
+    }
+
+    #[test]
+    fn forward_read_position_uses_the_alignment_start() {
+        // noodles is 1-based, pysam 0-based: position 101 -> pos 100.
+        let r = positioned("r", 101, &[(Kind::Match, 50)], false);
+        let p = get_read_position(&r, 4).unwrap();
+        assert_eq!(p.pos, 100);
+        assert_eq!(p.start, 100);
+        assert_eq!(p.is_spliced, None);
+    }
+
+    #[test]
+    fn forward_read_position_backs_out_a_leading_soft_clip() {
+        let r = positioned("r", 101, &[(Kind::SoftClip, 6), (Kind::Match, 44)], false);
+        let p = get_read_position(&r, 4).unwrap();
+        assert_eq!(p.pos, 94);
+        assert_eq!(p.start, 94);
+    }
+
+    #[test]
+    fn reverse_read_position_uses_the_alignment_end() {
+        let r = positioned("r", 101, &[(Kind::Match, 50)], true);
+        let p = get_read_position(&r, 4).unwrap();
+        // 1-based end 150; pysam's `aend` is the 0-based half-open end, 150.
+        assert_eq!(p.pos, 150);
+        assert_eq!(p.start, 100);
+    }
+
+    #[test]
+    fn reverse_read_position_adds_a_trailing_soft_clip() {
+        let r = positioned("r", 101, &[(Kind::Match, 44), (Kind::SoftClip, 6)], true);
+        let p = get_read_position(&r, 4).unwrap();
+        assert_eq!(p.pos, 150);
+    }
+
+    #[test]
+    fn spliced_reads_report_the_splice_offset() {
+        let r = positioned(
+            "r",
+            101,
+            &[(Kind::Match, 20), (Kind::Skip, 100), (Kind::Match, 30)],
+            false,
+        );
+        assert_eq!(get_read_position(&r, 4).unwrap().is_spliced, Some(20));
+    }
+
+    #[test]
+    fn a_soft_clip_under_the_threshold_is_not_a_splice() {
+        let r = positioned("r", 101, &[(Kind::Match, 46), (Kind::SoftClip, 4)], false);
+        assert_eq!(get_read_position(&r, 4).unwrap().is_spliced, None);
+        let r = positioned("r", 101, &[(Kind::Match, 45), (Kind::SoftClip, 5)], false);
+        assert_eq!(get_read_position(&r, 4).unwrap().is_spliced, Some(45));
+    }
+
+    #[test]
+    fn unpositioned_records_are_alignment_errors() {
+        let r = record("r");
+        assert!(matches!(
+            get_read_position(&r, 4),
+            Err(PortError::Alignment(_))
+        ));
+    }
+
+    #[test]
+    fn gene_count_tab_groups_by_gene() {
+        let data = "r1_AAA\tgeneA\nr2_AAA\tgeneA\nr3_CCC\tgeneA\nr4_GGG\tgeneB\n";
+        let groups: Vec<(String, CellUmiCounts)> =
+            GeneCountTab::new(data.as_bytes(), StringBarcodeGetter::UmiOnly, "_")
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].0, "geneA");
+        let cell = groups[0].1.get(&None).expect("the no-cell entry");
+        assert_eq!(cell.counts[&b"AAA".to_vec()], 2);
+        assert_eq!(cell.counts[&b"CCC".to_vec()], 1);
+        // First-seen order, not sorted order.
+        assert_eq!(cell.umis, vec![b"AAA".to_vec(), b"CCC".to_vec()]);
+        assert_eq!(groups[1].0, "geneB");
+    }
+
+    #[test]
+    fn gene_count_tab_per_cell() {
+        let data = "r1_CELL1_AAA\tgeneA\nr2_CELL2_AAA\tgeneA\n";
+        let groups: Vec<(String, CellUmiCounts)> =
+            GeneCountTab::new(data.as_bytes(), StringBarcodeGetter::CellAndUmi, "_")
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].1.len(), 2);
+        let cells = groups[0].1.cells();
+        assert_eq!(cells[0].cell.as_deref(), Some(&b"CELL1"[..]));
+        assert_eq!(cells[0].counts[&b"AAA".to_vec()], 1);
+        assert_eq!(cells[1].cell.as_deref(), Some(&b"CELL2"[..]));
+    }
+
+    #[test]
+    fn gene_count_tab_rejects_malformed_lines() {
+        let data = "r1_AAA\tgeneA\textra\n";
+        let err = GeneCountTab::new(data.as_bytes(), StringBarcodeGetter::UmiOnly, "_")
+            .collect::<Result<Vec<_>>>()
+            .unwrap_err();
+        assert!(matches!(err, PortError::Assertion(ref m)
+            if m.contains("does not contain 2 columns")));
+    }
+
+    #[test]
+    fn gene_count_tab_on_an_empty_stream_yields_nothing() {
+        let groups: Vec<(String, CellUmiCounts)> =
+            GeneCountTab::new(&b""[..], StringBarcodeGetter::UmiOnly, "_")
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn metacontig_map_keeps_only_known_transcripts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("map.tsv");
+        std::fs::write(
+            &path,
+            "# header\ngeneA\ttx1\ngeneA\ttx2\ngeneB\ttx3\ngeneC\tmissing\n",
+        )
+        .unwrap();
+        let refs: BTreeSet<String> = ["tx1", "tx2", "tx3"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let map = get_metacontig2contig(&refs, &path).unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map["geneA"].len(), 2);
+        assert!(!map.contains_key("geneC"));
+    }
+
+    #[test]
+    fn metacontig_map_stops_at_a_blank_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("map.tsv");
+        std::fs::write(&path, "geneA\ttx1\n\ngeneB\ttx2\n").unwrap();
+        let refs: BTreeSet<String> = ["tx1", "tx2"].iter().map(|s| (*s).to_string()).collect();
+        let map = get_metacontig2contig(&refs, &path).unwrap();
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn barcode_getter_dispatch() {
+        let mut r = record("read1_CELL_ACGT");
+        let g = BarcodeGetter::ReadId {
+            cell_barcode: true,
+            sep: "_".to_string(),
+        };
+        assert_eq!(g.get(&r).unwrap().umi, b"ACGT");
+
+        r.data_mut()
+            .insert(Tag::from(*b"RX"), Value::String("TTTT".into()));
+        let g = BarcodeGetter::Tag(TagConfig::default());
+        assert_eq!(g.get(&r).unwrap().umi, b"TTTT");
+
+        let r = record("READ:UMI_GGGG");
+        let g = BarcodeGetter::Umis {
+            cell_barcode: false,
+        };
+        assert_eq!(g.get(&r).unwrap().umi, b"GGGG");
+    }
+}

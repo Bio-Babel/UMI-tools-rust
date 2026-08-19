@@ -1,0 +1,48 @@
+package: umi_tools
+created: '2026-08-18'
+steps:
+  0_init:
+    status: complete
+    completed: '2026-08-18'
+  1_baseline:
+    status: complete
+    completed: '2026-08-18'
+  2_audit:
+    status: complete
+    completed: '2026-08-18'
+  3_checklist:
+    status: complete
+    completed: '2026-08-18'
+  4_data:
+    status: complete
+    completed: '2026-08-18'
+  5_compiled:
+    status: complete
+    completed: '2026-08-18'
+  6_deps:
+    status: complete
+    completed: '2026-08-18'
+  7_design:
+    status: complete
+    completed: '2026-08-18'
+  8_implement:
+    status: complete
+    completed: '2026-08-18'
+  9_differential_validation:
+    status: complete
+    completed: '2026-08-18'
+  10_data_staging:
+    status: skipped
+  11_example_parity:
+    status: complete
+    completed: '2026-08-18'
+  12_docs:
+    status: complete
+    completed: '2026-08-18'
+checklist:
+  total: 133
+  not_started: 0
+  in_progress: 0
+  implemented: 0
+  validated: 133
+  deferred: 0

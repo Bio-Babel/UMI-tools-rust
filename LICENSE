@@ -19,3 +19,19 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+
+## Upstream notice
+
+This project is a Rust port of UMI-tools
+(https://github.com/CGATOxford/UMI-tools), which is distributed under the MIT
+License. Its copyright notice is retained here as that license requires:
+
+    The MIT License (MIT)
+
+    Copyright (c) 2015 CGAT
+
+Test fixtures under `crates/core/tests/fixtures/` and reference outputs used
+for differential validation are taken from the UMI-tools repository and remain
+subject to the notice above.
