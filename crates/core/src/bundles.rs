@@ -11,11 +11,11 @@
 //! gene), nothing further can join that position's bundle, so it is flushed.
 //! That is what lets `umi_tools` deduplicate a BAM far larger than memory.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
-use noodles_sam::alignment::record::data::field::Tag;
-use noodles_sam::alignment::RecordBuf;
+use indexmap::IndexMap;
 
+use crate::alignment::BamRecord;
 use crate::error::{PortError, Result};
 use crate::options::{BundleOptions, ChimericPairs, DetectionMethod, UnmappedReads, UnpairedReads};
 use crate::sam::{get_read_position, BarcodeGetter};
@@ -26,20 +26,45 @@ use crate::utilities;
 /// Python distinguishes these three modes only by which dictionary keys it
 /// happens to populate, so reading `bundle[umi]["read"]` in `only_count_reads`
 /// mode is a `KeyError`. The enum makes the distinction a compile-time one.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum BundleReads {
     /// The single best read for this key (the default for `dedup`).
-    One(Box<RecordBuf>),
+    One(BamRecord),
     /// Every read for this key (`group`, via `all_reads`).
-    Many(Vec<RecordBuf>),
+    Many(Vec<BamRecord>),
+    /// The `--group-out` fields of every read (`group` without `--output-bam`).
+    Summaries(Vec<ReadSummary>),
     /// No reads retained, only the count (`count`, via `only_count_reads`).
+    #[default]
     CountOnly,
+}
+
+/// What `group --group-out` reports of a read, kept in place of the read
+/// when no reads are written out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadSummary {
+    /// The read name, empty for `*`.
+    pub name: Box<[u8]>,
+    /// The reference-sequence index.
+    pub reference_id: Option<usize>,
+    /// The grouping coordinate.
+    pub position: i64,
+}
+
+impl ReadSummary {
+    fn of(record: &BamRecord, position: i64) -> Self {
+        Self {
+            name: record.name().unwrap_or_default().into(),
+            reference_id: record.reference_id(),
+            position,
+        }
+    }
 }
 
 impl BundleReads {
     /// The single retained read, if this entry holds one.
     #[must_use]
-    pub fn one(&self) -> Option<&RecordBuf> {
+    pub fn one(&self) -> Option<&BamRecord> {
         match self {
             BundleReads::One(r) => Some(r),
             _ => None,
@@ -48,9 +73,18 @@ impl BundleReads {
 
     /// Every retained read, empty when none were kept.
     #[must_use]
-    pub fn all(&self) -> &[RecordBuf] {
+    pub fn all(&self) -> &[BamRecord] {
         match self {
             BundleReads::Many(v) => v,
+            _ => &[],
+        }
+    }
+
+    /// Every retained summary, empty when none were kept.
+    #[must_use]
+    pub fn summaries(&self) -> &[ReadSummary] {
+        match self {
+            BundleReads::Summaries(v) => v,
             _ => &[],
         }
     }
@@ -58,25 +92,21 @@ impl BundleReads {
 
 /// One UMI's entry in a bundle
 /// (Python source: the `{"read": ..., "count": ...}` inner dictionary).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BundleEntry {
     /// The retained read(s).
     pub reads: BundleReads,
     /// How many reads shared this key.
     pub count: u64,
-    /// A monotonic sequence number recording when this UMI was first seen.
-    ///
-    /// Python's bundle is a `dict`, which preserves insertion order, and the
-    /// clustering stage takes its UMIs in that order — which decides the order
-    /// the deduplicated reads are written in. A `BTreeMap` sorts instead, so
-    /// the original order has to be carried explicitly; see
-    /// [`insertion_order`].
-    pub first_seen: u64,
 }
 
-/// UMI to entry, for one position/gene and cell barcode
-/// (Python source: the dictionary `get_bundles` yields).
-pub type Bundle = BTreeMap<Vec<u8>, BundleEntry>;
+/// UMI to entry, for one position/gene and cell barcode, in the order the
+/// UMIs were first seen (Python source: the dictionary `get_bundles` yields).
+///
+/// The order is Python's `dict` insertion order, and it matters: the
+/// clustering stage takes the UMIs in that order, which decides the order the
+/// deduplicated reads are written in.
+pub type Bundle = IndexMap<Vec<u8>, BundleEntry>;
 
 /// The key a bundle was grouped under
 /// (Python source: the `key` element of the yielded 3-tuple).
@@ -93,12 +123,12 @@ pub struct BundleKey {
 
 /// The coordinate-derived part of a bundle key
 /// (Python source: the `(is_reverse, spliced, tlen, r_length)` tuple).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CoordinateKey {
     /// Whether the read is on the reverse strand.
     pub is_reverse: bool,
-    /// Whether the read is spliced, when `--spliced-is-unique` is set.
-    pub spliced: bool,
+    /// The first splice offset under `--spliced-is-unique`, else 0 (Python's `False`).
+    pub spliced: usize,
     /// The template length, zeroed unless paired and `--ignore-tlen` is off.
     pub template_length: i32,
     /// The read length, zero unless `--read-length` is set.
@@ -112,7 +142,7 @@ pub struct CoordinateKey {
 pub enum BundleItem {
     /// A read passed straight through without grouping — a read 2, an unmapped
     /// read, or a chimeric/unpaired read the options said to output.
-    Single(Box<RecordBuf>),
+    Single(BamRecord),
     /// A completed bundle.
     Bundle {
         /// UMI to entry.
@@ -125,7 +155,7 @@ pub enum BundleItem {
 /// The bundle's UMIs in the order they were first seen
 /// (Python source: the `dict` insertion order `bundle.keys()` yields).
 ///
-/// `dedup`, `group` and `count` all pass this to
+/// `dedup`, `group` and `count` pass this to
 /// [`crate::network::UmiClusterer::cluster_ordered`], because the clustering
 /// order decides the order the output reads are written in and the package's
 /// own test suite compares that output byte for byte.
@@ -137,23 +167,14 @@ pub enum BundleItem {
 ///
 /// let mut bundle = Bundle::new();
 /// // "TTTT" sorts after "AAAA" but was seen first.
-/// bundle.insert(b"TTTT".to_vec(), BundleEntry {
-///     reads: BundleReads::CountOnly, count: 1, first_seen: 0 });
-/// bundle.insert(b"AAAA".to_vec(), BundleEntry {
-///     reads: BundleReads::CountOnly, count: 1, first_seen: 1 });
+/// bundle.insert(b"TTTT".to_vec(), BundleEntry { reads: BundleReads::CountOnly, count: 1 });
+/// bundle.insert(b"AAAA".to_vec(), BundleEntry { reads: BundleReads::CountOnly, count: 1 });
 ///
 /// assert_eq!(insertion_order(&bundle), vec![b"TTTT".to_vec(), b"AAAA".to_vec()]);
 /// ```
 #[must_use]
 pub fn insertion_order(bundle: &Bundle) -> Vec<Vec<u8>> {
-    let mut entries: Vec<(&Vec<u8>, u64)> = bundle
-        .iter()
-        .map(|(umi, entry)| (umi, entry.first_seen))
-        .collect();
-    // Stable, and ties fall back to the UMI itself, so the order is total
-    // even if two entries somehow share a sequence number.
-    entries.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(b.0)));
-    entries.into_iter().map(|(umi, _)| umi.clone()).collect()
+    bundle.keys().cloned().collect()
 }
 
 /// Which reads the bundler should retain and pass through
@@ -164,6 +185,8 @@ pub struct BundleFlags {
     pub only_count_reads: bool,
     /// Retain every read per key (`group`).
     pub all_reads: bool,
+    /// With `all_reads`, retain a [`ReadSummary`] instead of each read.
+    pub summarise_reads: bool,
     /// Emit unmapped reads instead of dropping them.
     pub return_unmapped: bool,
     /// Emit read 2 immediately instead of dropping it.
@@ -177,6 +200,49 @@ pub struct BundleFlags {
 /// reads longer than 1000 bases could in principle flush a position early.
 /// Mirrored rather than corrected.
 pub const FLUSH_MARGIN: i64 = 1000;
+
+/// Python's bundle key without the gene, plus the UMI.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SlotKey {
+    coordinate: Option<CoordinateKey>,
+    barcode: Box<[u8]>,
+    cell_len: Option<u32>,
+}
+
+impl SlotKey {
+    fn new(coordinate: Option<CoordinateKey>, cell: Option<Vec<u8>>, umi: &[u8]) -> Self {
+        let cell_len = cell
+            .as_ref()
+            .map(|c| u32::try_from(c.len()).unwrap_or(u32::MAX));
+        let cell = cell.unwrap_or_default();
+        let mut barcode = Vec::with_capacity(cell.len() + umi.len());
+        barcode.extend_from_slice(&cell);
+        barcode.extend_from_slice(umi);
+        Self {
+            coordinate,
+            barcode: barcode.into_boxed_slice(),
+            cell_len,
+        }
+    }
+
+    fn cell(&self) -> Option<&[u8]> {
+        self.cell_len.map(|n| &self.barcode[..n as usize])
+    }
+
+    fn umi(&self) -> &[u8] {
+        &self.barcode[self.cell_len.map_or(0, |n| n as usize)..]
+    }
+}
+
+/// Python's `reads_dict[pos][key][umi]` and `read_counts[pos][key][umi]`.
+#[derive(Debug)]
+struct Slot {
+    reads: BundleReads,
+    count: u64,
+    ties: u64,
+}
+
+type PositionSlots = IndexMap<SlotKey, Slot>;
 
 /// Groups alignment records into bundles of candidate duplicates
 /// (Python source: `sam_methods.get_bundles`).
@@ -198,7 +264,7 @@ pub const FLUSH_MARGIN: i64 = 1000;
 /// let getter = BarcodeGetter::ReadId { cell_barcode: false, sep: "_".into() };
 /// let mut bundler = GetBundles::new(&options, BundleFlags::default(), getter);
 ///
-/// # let records: Vec<noodles_sam::alignment::RecordBuf> = Vec::new();
+/// # let records: Vec<umi_tools_core::BamRecord> = Vec::new();
 /// for record in records {
 ///     for item in bundler.push(record, None)? {
 ///         // handle each Single or Bundle
@@ -214,22 +280,19 @@ pub struct GetBundles {
     flags: BundleFlags,
     barcode_getter: BarcodeGetter,
 
-    /// Position (or gene) to key to UMI to entry.
-    reads_dict: BTreeMap<PositionKey, BTreeMap<BundleKey, Bundle>>,
-    /// Reservoir-sampling counters, parallel to `reads_dict`.
-    read_counts: BTreeMap<PositionKey, BTreeMap<BundleKey, BTreeMap<Vec<u8>, u64>>>,
+    reads_dict: BTreeMap<PositionKey, PositionSlots>,
+    ready: VecDeque<Queued>,
+    emitting: Option<Emitting>,
     /// Gene to the transcripts observed for it, for the metacontig path.
-    observed_contigs: BTreeMap<String, std::collections::BTreeSet<String>>,
+    observed_contigs: BTreeMap<String, indexmap::IndexSet<String>>,
     metacontig_contig: Option<crate::sam::MetaContigMap>,
     contig_metacontig: BTreeMap<String, String>,
 
     read_events: BTreeMap<String, u64>,
     last_pos: PositionKey,
-    last_chr: Option<String>,
+    last_chr: Option<usize>,
     start: i64,
-    current_chr: Option<String>,
-    /// Increments once per newly-seen UMI, recording insertion order.
-    sequence: u64,
+    current_chr: Option<usize>,
 
     rng: crate::mersenne::MersenneTwister,
 }
@@ -251,19 +314,14 @@ impl Default for PositionKey {
 }
 
 /// What should happen to a newly-seen read at an already-occupied key.
-///
-/// Computed with only `&self` borrowed, so the mutable borrow of
-/// `reads_dict` in [`update_dicts`](Self::update_dicts) never overlaps a
-/// read of `self.options` or a call to the sampler. That separation is the
-/// point: the alternative — cloning the stored record so the comparison
-/// can happen under a mutable borrow — would copy a record per duplicate
-/// read, on the hottest path in the program.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Replacement {
     /// Keep the stored read.
     Keep,
-    /// Replace it, and reset the tie counter.
+    /// Replace it, and reset the tie counter (higher mapping quality).
     Replace,
+    /// Replace it and still draw (Python's multimapping branch has no `return`).
+    ReplaceAndDraw,
     /// Still tied: fall through to reservoir sampling.
     Tied,
 }
@@ -281,7 +339,8 @@ impl GetBundles {
             flags,
             barcode_getter,
             reads_dict: BTreeMap::new(),
-            read_counts: BTreeMap::new(),
+            ready: VecDeque::new(),
+            emitting: None,
             observed_contigs: BTreeMap::new(),
             metacontig_contig: None,
             contig_metacontig: BTreeMap::new(),
@@ -290,7 +349,6 @@ impl GetBundles {
             last_chr: None,
             start: 0,
             current_chr: None,
-            sequence: 0,
             // `Utilities.Start` calls `random.seed(options.random_seed)` when
             // the flag is given, so the tie-break stream is CPython's. Without
             // the flag, Python leaves `random` auto-seeded from OS entropy and
@@ -329,8 +387,18 @@ impl GetBundles {
         &self.barcode_getter
     }
 
+    /// How many `(key, umi)` entries are waiting to be flushed.
+    #[must_use]
+    pub fn pending(&self) -> usize {
+        self.reads_dict.values().map(IndexMap::len).sum()
+    }
+
     fn event(&mut self, name: &str) {
-        *self.read_events.entry(name.to_string()).or_insert(0) += 1;
+        if let Some(n) = self.read_events.get_mut(name) {
+            *n += 1;
+        } else {
+            self.read_events.insert(name.to_string(), 1);
+        }
     }
 
     /// Returns the next uniform value in `[0, 1)`, from `CPython`'s generator.
@@ -344,33 +412,40 @@ impl GetBundles {
         self.rng.random()
     }
 
-    fn multimap_tag(record: &RecordBuf, tag: [u8; 2]) -> Option<i64> {
-        use noodles_sam::alignment::record_buf::data::field::Value;
-        match record.data().get(&Tag::from(tag))? {
-            Value::Int8(v) => Some(i64::from(*v)),
-            Value::UInt8(v) => Some(i64::from(*v)),
-            Value::Int16(v) => Some(i64::from(*v)),
-            Value::UInt16(v) => Some(i64::from(*v)),
-            Value::Int32(v) => Some(i64::from(*v)),
-            Value::UInt32(v) => Some(i64::from(*v)),
+    fn multimap_tag(record: &BamRecord, tag: [u8; 2]) -> Option<i64> {
+        use noodles_sam::alignment::record::data::field::Value;
+        let view = record.view();
+        match view.data().get(&tag)?.ok()? {
+            Value::Int8(v) => Some(i64::from(v)),
+            Value::UInt8(v) => Some(i64::from(v)),
+            Value::Int16(v) => Some(i64::from(v)),
+            Value::UInt16(v) => Some(i64::from(v)),
+            Value::Int32(v) => Some(i64::from(v)),
+            Value::UInt32(v) => Some(i64::from(v)),
             _ => None,
         }
     }
 
-    fn xt_is_unique(record: &RecordBuf) -> bool {
-        use noodles_sam::alignment::record_buf::data::field::Value;
-        matches!(
-            record.data().get(&Tag::from(*b"XT")),
-            Some(Value::Character(b'U'))
-        )
+    fn xt_is_unique(record: &BamRecord) -> bool {
+        use noodles_sam::alignment::record::data::field::Value;
+        let view = record.view();
+        match view.data().get(b"XT") {
+            Some(Ok(Value::Character(b'U'))) => true,
+            Some(Ok(Value::String(s))) => <[u8]>::eq(s.as_ref(), b"U"),
+            _ => false,
+        }
     }
 
     /// Decides between the stored read and a new one, on mapping quality and
     /// then the multimapping tag (Python source: the comparison chain in the
     /// `else` branch of `get_bundles.update_dicts`).
-    fn compare(&self, current: &RecordBuf, candidate: &RecordBuf) -> Replacement {
-        let current_mapq = crate::sam::raw_mapping_quality(current);
-        let new_mapq = crate::sam::raw_mapping_quality(candidate);
+    fn compare(
+        detection_method: Option<DetectionMethod>,
+        current: &BamRecord,
+        candidate: &BamRecord,
+    ) -> Replacement {
+        let current_mapq = current.mapping_quality();
+        let new_mapq = candidate.mapping_quality();
         if current_mapq > new_mapq {
             return Replacement::Keep;
         }
@@ -378,7 +453,7 @@ impl GetBundles {
             return Replacement::Replace;
         }
 
-        match self.options.detection_method {
+        match detection_method {
             Some(method @ (DetectionMethod::Nh | DetectionMethod::X0)) => {
                 let tag = if method == DetectionMethod::Nh {
                     *b"NH"
@@ -391,7 +466,7 @@ impl GetBundles {
                 ) {
                     // Fewer reported alignments is the better read.
                     (Some(a), Some(b)) if a < b => Replacement::Keep,
-                    (Some(a), Some(b)) if a > b => Replacement::Replace,
+                    (Some(a), Some(b)) if a > b => Replacement::ReplaceAndDraw,
                     _ => Replacement::Tied,
                 }
             }
@@ -399,22 +474,13 @@ impl GetBundles {
                 if Self::xt_is_unique(current) {
                     Replacement::Keep
                 } else if Self::xt_is_unique(candidate) {
-                    Replacement::Replace
+                    Replacement::ReplaceAndDraw
                 } else {
                     Replacement::Tied
                 }
             }
             None => Replacement::Tied,
         }
-    }
-
-    fn reset_tie_counter(&mut self, pos: &PositionKey, key: &BundleKey, umi: &[u8]) {
-        self.read_counts
-            .entry(pos.clone())
-            .or_default()
-            .entry(key.clone())
-            .or_default()
-            .insert(umi.to_vec(), 0);
     }
 
     /// Files one read into the bundle at `(pos, key, umi)`
@@ -430,142 +496,99 @@ impl GetBundles {
     ///   rather than the first or last winning systematically.
     pub fn update_dicts(
         &mut self,
-        record: RecordBuf,
+        record: BamRecord,
         pos: PositionKey,
         key: BundleKey,
         umi: Vec<u8>,
-    ) {
-        // Reserved up front so every insertion arm sees the same value and no
-        // arm has to reach back through a live borrow of `reads_dict`.
-        let sequence = self.sequence;
-        let claim = |bundler: &mut Self, umi: &[u8], pos: &PositionKey, key: &BundleKey| {
-            let already_present = bundler
-                .reads_dict
-                .get(pos)
-                .and_then(|by_key| by_key.get(key))
-                .is_some_and(|bundle| bundle.contains_key(umi));
-            if !already_present {
-                bundler.sequence += 1;
+    ) -> Result<()> {
+        self.file(record, pos, SlotKey::new(key.coordinate, key.cell, &umi))
+    }
+
+    fn file(&mut self, record: BamRecord, pos: PositionKey, key: SlotKey) -> Result<()> {
+        use indexmap::map::Entry;
+
+        let Self {
+            reads_dict,
+            flags,
+            options,
+            rng,
+            ..
+        } = self;
+        // Under `--per-gene` the position is the gene, so use the read's own.
+        let summary = if flags.all_reads && flags.summarise_reads {
+            let position = match &pos {
+                PositionKey::Coordinate(p) => *p,
+                PositionKey::Gene(_) => {
+                    get_read_position(&record, options.soft_clip_threshold)?.pos
+                }
+            };
+            Some(ReadSummary::of(&record, position))
+        } else {
+            None
+        };
+
+        let slots = reads_dict
+            .entry(pos)
+            .or_insert_with(|| PositionSlots::with_capacity(1));
+
+        let slot = match slots.entry(key) {
+            Entry::Vacant(vacant) => {
+                let reads = if let Some(summary) = summary {
+                    BundleReads::Summaries(vec![summary])
+                } else if flags.all_reads {
+                    BundleReads::Many(vec![record])
+                } else if flags.only_count_reads {
+                    BundleReads::CountOnly
+                } else {
+                    BundleReads::One(record)
+                };
+                vacant.insert(Slot {
+                    reads,
+                    count: 1,
+                    ties: 0,
+                });
+                return Ok(());
             }
-        };
-        claim(self, &umi, &pos, &key);
-
-        if self.flags.all_reads {
-            self.reads_dict
-                .entry(pos)
-                .or_default()
-                .entry(key)
-                .or_default()
-                .entry(umi)
-                .and_modify(|e| {
-                    e.count += 1;
-                    if let BundleReads::Many(v) = &mut e.reads {
-                        v.push(record.clone());
-                    }
-                })
-                .or_insert_with(|| BundleEntry {
-                    reads: BundleReads::Many(vec![record]),
-                    count: 1,
-                    first_seen: sequence,
-                });
-            return;
-        }
-
-        if self.flags.only_count_reads {
-            self.reads_dict
-                .entry(pos)
-                .or_default()
-                .entry(key)
-                .or_default()
-                .entry(umi)
-                .and_modify(|e| e.count += 1)
-                .or_insert(BundleEntry {
-                    reads: BundleReads::CountOnly,
-                    count: 1,
-                    first_seen: sequence,
-                });
-            return;
-        }
-
-        // Single-best mode. Decide first, with only `&self` borrowed, then
-        // apply — see `Replacement`.
-        let existing = self
-            .reads_dict
-            .get(&pos)
-            .and_then(|by_key| by_key.get(&key))
-            .and_then(|bundle| bundle.get(&umi));
-
-        let Some(existing) = existing else {
-            self.reads_dict
-                .entry(pos.clone())
-                .or_default()
-                .entry(key.clone())
-                .or_default()
-                .insert(
-                    umi.clone(),
-                    BundleEntry {
-                        reads: BundleReads::One(Box::new(record)),
-                        count: 1,
-                        first_seen: sequence,
-                    },
-                );
-            self.reset_tie_counter(&pos, &key, &umi);
-            return;
+            Entry::Occupied(occupied) => occupied.into_mut(),
         };
 
-        let decision = match existing.reads.one() {
-            Some(current) => self.compare(current, &record),
-            // `only_count_reads` never runs this branch, and the other two
-            // modes returned above, so this is unreachable in practice.
-            None => Replacement::Keep,
-        };
-
-        // The count rises however the comparison went.
-        if let Some(entry) = self
-            .reads_dict
-            .get_mut(&pos)
-            .and_then(|by_key| by_key.get_mut(&key))
-            .and_then(|bundle| bundle.get_mut(&umi))
-        {
-            entry.count += 1;
+        slot.count += 1;
+        if flags.all_reads {
+            match (&mut slot.reads, summary) {
+                (BundleReads::Summaries(v), Some(summary)) => v.push(summary),
+                (BundleReads::Many(v), None) => v.push(record),
+                _ => {}
+            }
+            return Ok(());
+        }
+        if flags.only_count_reads {
+            return Ok(());
         }
 
+        let decision = match &slot.reads {
+            BundleReads::One(current) => Self::compare(options.detection_method, current, &record),
+            _ => Replacement::Keep,
+        };
         match decision {
             Replacement::Keep => {}
             Replacement::Replace => {
-                if let Some(entry) = self
-                    .reads_dict
-                    .get_mut(&pos)
-                    .and_then(|by_key| by_key.get_mut(&key))
-                    .and_then(|bundle| bundle.get_mut(&umi))
-                {
-                    entry.reads = BundleReads::One(Box::new(record));
-                }
-                self.reset_tie_counter(&pos, &key, &umi);
+                slot.reads = BundleReads::One(record);
+                slot.ties = 0;
+            }
+            Replacement::ReplaceAndDraw => {
+                slot.reads = BundleReads::One(record);
+                slot.ties = 1;
+                let _ = rng.random();
             }
             Replacement::Tied => {
-                let seen = self
-                    .read_counts
-                    .entry(pos.clone())
-                    .or_default()
-                    .entry(key.clone())
-                    .or_default()
-                    .entry(umi.clone())
-                    .or_insert(0);
-                *seen += 1;
-                let probability = 1.0 / (*seen as f64);
-                if self.next_uniform() < probability {
-                    if let Some(entry) = self
-                        .reads_dict
-                        .get_mut(&pos)
-                        .and_then(|by_key| by_key.get_mut(&key))
-                        .and_then(|bundle| bundle.get_mut(&umi))
-                    {
-                        entry.reads = BundleReads::One(Box::new(record));
-                    }
+                slot.ties += 1;
+                let probability = 1.0 / (slot.ties as f64);
+                if rng.random() < probability {
+                    slot.reads = BundleReads::One(record);
                 }
             }
         }
+        Ok(())
     }
 
     /// Whether any bundles can be flushed, and which
@@ -577,7 +600,7 @@ impl GetBundles {
     ///   once every transcript of the last gene has been seen.
     /// - `--whole-contig`: flush on a contig change.
     /// - otherwise: flush once the scan is more than [`FLUSH_MARGIN`] bases
-    ///   past a position, or on a contig change.
+    ///   past the previous read, or on a contig change.
     #[must_use]
     pub fn check_output(&self) -> (bool, Vec<PositionKey>) {
         let chr_changed = self.current_chr != self.last_chr;
@@ -626,45 +649,59 @@ impl GetBundles {
         }
     }
 
-    fn flush(&mut self, keys: &[PositionKey]) -> Vec<BundleItem> {
-        let mut out = Vec::new();
+    fn flush(&mut self, keys: Vec<PositionKey>) {
         for position in keys {
-            if let Some(by_key) = self.reads_dict.remove(position) {
-                for (key, bundle) in by_key {
-                    out.push(BundleItem::Bundle { bundle, key });
+            if let Some(slots) = self.reads_dict.remove(&position) {
+                self.ready.push_back(Queued::Position(position, slots));
+            }
+        }
+    }
+
+    fn next_ready(&mut self) -> Option<BundleItem> {
+        loop {
+            if let Some(bundle) = self.emitting.as_mut().and_then(Emitting::next_bundle) {
+                return Some(bundle);
+            }
+            self.emitting = None;
+            match self.ready.pop_front()? {
+                Queued::Single(record) => return Some(BundleItem::Single(record)),
+                Queued::Position(position, slots) => {
+                    self.emitting = Some(Emitting::new(position, slots));
                 }
             }
-            self.read_counts.remove(position);
         }
-        out
     }
 
     /// Feeds one record to the bundler
     /// (Python source: the body of `get_bundles.__call__`'s loop).
     ///
-    /// `reference_name` is the record's contig; it is passed separately
-    /// because `RecordBuf` stores a reference *id*, and resolving it needs the
-    /// header the caller already holds.
+    /// `reference_name` is the contig name, the gene under `--per-contig`.
     ///
     /// Returns the bundles (and pass-through reads) this record completed.
+    /// They are produced lazily; items not taken are handed out by the next call.
     ///
     /// # Errors
     ///
     /// - [`PortError::Value`] from the coordinate arithmetic or a malformed
     ///   read name.
-    /// - [`PortError::Alignment`] for a mapped record with no position.
-    pub fn push(
-        &mut self,
-        record: RecordBuf,
-        reference_name: Option<&str>,
-    ) -> Result<Vec<BundleItem>> {
+    /// - [`PortError::Alignment`] for a mapped record with no position, or
+    ///   unparseable tags.
+    pub fn push(&mut self, record: BamRecord, reference_name: Option<&str>) -> Result<Ready<'_>> {
+        self.file_read(record, reference_name)?;
+        Ok(Ready { bundler: self })
+    }
+
+    fn file_read(&mut self, record: BamRecord, reference_name: Option<&str>) -> Result<()> {
         let flags = record.flags();
 
         if flags.is_segmented() && flags.is_last_segment() {
             if self.flags.return_read2 && (!flags.is_unmapped() || self.flags.return_unmapped) {
-                return Ok(vec![BundleItem::Single(Box::new(record))]);
+                {
+                    self.ready.push_back(Queued::Single(record));
+                    return Ok(());
+                }
             }
-            return Ok(Vec::new());
+            return Ok(());
         }
         self.event("Input Reads");
 
@@ -675,8 +712,11 @@ impl GetBundles {
             } else {
                 self.event("Unpaired reads");
                 match self.options.unpaired_reads {
-                    UnpairedReads::Discard => return Ok(Vec::new()),
-                    UnpairedReads::Output => return Ok(vec![BundleItem::Single(Box::new(record))]),
+                    UnpairedReads::Discard => return Ok(()),
+                    // Python has no `continue` here: the read is bundled too.
+                    UnpairedReads::Output => {
+                        self.ready.push_back(Queued::Single(record.clone()));
+                    }
                     // "use" falls through: the pair is used and TLEN will be 0.
                     UnpairedReads::Use => {}
                 }
@@ -698,43 +738,51 @@ impl GetBundles {
                 // like a slip, but it is observable in the log line the test
                 // suite compares, so it is mirrored.
                 self.event("Input Reads");
-                return Ok(vec![BundleItem::Single(Box::new(record))]);
+                {
+                    self.ready.push_back(Queued::Single(record));
+                    return Ok(());
+                }
             }
-            return Ok(Vec::new());
+            return Ok(());
         }
 
         if self.options.paired && flags.is_mate_unmapped() {
             self.event("Read 2 unmapped");
             if self.options.unmapped_reads != UnmappedReads::Use {
                 if self.flags.return_unmapped {
-                    return Ok(vec![BundleItem::Single(Box::new(record))]);
+                    {
+                        self.ready.push_back(Queued::Single(record));
+                        return Ok(());
+                    }
                 }
-                return Ok(Vec::new());
+                return Ok(());
             }
         }
 
-        if flags.is_segmented()
-            && record.reference_sequence_id() != record.mate_reference_sequence_id()
-        {
+        if flags.is_segmented() && record.reference_id() != record.mate_reference_id() {
             self.event("Chimeric read pair");
             match self.options.chimeric_pairs {
-                ChimericPairs::Discard => return Ok(Vec::new()),
-                ChimericPairs::Output => return Ok(vec![BundleItem::Single(Box::new(record))]),
+                ChimericPairs::Discard => return Ok(()),
+                ChimericPairs::Output => {
+                    self.ready.push_back(Queued::Single(record));
+                    return Ok(());
+                }
                 ChimericPairs::Use => {}
             }
         }
 
-        if let Some(subset) = self.options.subset {
+        // `if self.options.subset:`, so 0 turns subsetting off.
+        if let Some(subset) = self.options.subset.filter(|&s| s != 0.0) {
             if self.next_uniform() >= subset {
                 self.event("Randomly excluded");
-                return Ok(Vec::new());
+                return Ok(());
             }
         }
 
         if let Some(threshold) = self.options.mapping_quality {
-            if u32::from(crate::sam::raw_mapping_quality(&record)) < threshold {
+            if u32::from(record.mapping_quality()) < threshold {
                 self.event("< MAPQ threshold");
-                return Ok(Vec::new());
+                return Ok(());
             }
         }
 
@@ -754,22 +802,18 @@ impl GetBundles {
         } else {
             let msg = "Read skipped, missing umi and/or cell tag";
             if !self.read_events.contains_key(msg) {
-                let name = record
-                    .name()
-                    .map(|n| String::from_utf8_lossy(n.as_ref()).into_owned())
-                    .unwrap_or_default();
+                let name = String::from_utf8_lossy(record.name().unwrap_or_default()).into_owned();
                 utilities::warn(&format!(
                     "At least one read is missing UMI and/or cell tag(s): {name}"
                 ));
             }
             self.event(msg);
-            return Ok(Vec::new());
+            return Ok(());
         };
 
-        self.current_chr = reference_name.map(str::to_string);
+        self.current_chr = record.reference_id();
 
-        let mut out = Vec::new();
-        let (pos, key);
+        let (pos, coordinate);
 
         if self.options.per_gene {
             let mut transcript = None;
@@ -793,12 +837,12 @@ impl GetBundles {
                     ));
                 };
                 let assigned_tag = self.options.assigned_tag.unwrap_or(gene_tag);
-                let (Some(assigned), Some(gene)): (Option<String>, Option<String>) = (
-                    crate::sam::tag_text(&record, assigned_tag),
-                    crate::sam::tag_text(&record, gene_tag),
+                let (Some(assigned), Some(gene)) = (
+                    crate::sam::tag_text(&record, assigned_tag)?,
+                    crate::sam::tag_text(&record, gene_tag)?,
                 ) else {
                     self.event("Read skipped, no tag");
-                    return Ok(Vec::new());
+                    return Ok(());
                 };
                 if gene.is_empty() {
                     let msg = "Read skipped - gene string is empty";
@@ -806,52 +850,46 @@ impl GetBundles {
                         utilities::warn("Assigned gene is empty string. First such read");
                     }
                     self.event(msg);
-                    return Ok(Vec::new());
+                    return Ok(());
                 }
                 if let Some(skip) = &self.options.skip_regex {
                     if skip.is_match(&assigned) {
                         self.event("Read skipped - assigned tag matches skip_regex");
-                        return Ok(Vec::new());
+                        return Ok(());
                     }
                 }
                 gene
             };
 
-            pos = PositionKey::Gene(gene.clone());
-            key = BundleKey {
-                gene: Some(gene.clone()),
-                coordinate: None,
-                cell: barcode.cell.clone(),
-            };
-
             if self.last_chr.is_some() {
                 let (do_output, keys) = self.check_output();
                 if do_output {
-                    out.extend(self.flush(&keys));
+                    self.flush(keys);
                 }
             }
-            self.last_chr = self.current_chr.clone();
-            self.last_pos = pos.clone();
-
+            self.last_chr = self.current_chr;
             if let Some(transcript) = transcript {
                 self.observed_contigs
-                    .entry(gene)
+                    .entry(gene.clone())
                     .or_default()
                     .insert(transcript);
             }
+            pos = PositionKey::Gene(gene);
+            self.last_pos = pos.clone();
+            coordinate = None;
         } else {
             let position = get_read_position(&record, self.options.soft_clip_threshold)?;
             self.start = position.start;
 
             let (do_output, keys) = self.check_output();
             if do_output {
-                out.extend(self.flush(&keys));
+                self.flush(keys);
             }
             self.last_pos = PositionKey::Coordinate(position.start);
-            self.last_chr = self.current_chr.clone();
+            self.last_chr = self.current_chr;
 
             let read_length = if self.options.read_length {
-                record.sequence().len()
+                record.sequence_length()
             } else {
                 0
             };
@@ -862,29 +900,106 @@ impl GetBundles {
             };
 
             pos = PositionKey::Coordinate(position.pos);
-            key = BundleKey {
-                gene: None,
-                coordinate: Some(CoordinateKey {
-                    is_reverse: record.flags().is_reverse_complemented(),
-                    spliced: self.options.spliced && position.is_spliced.is_some(),
-                    template_length,
-                    read_length,
-                }),
-                cell: barcode.cell.clone(),
-            };
+            coordinate = Some(CoordinateKey {
+                is_reverse: flags.is_reverse_complemented(),
+                spliced: if self.options.spliced {
+                    position.is_spliced.unwrap_or(0)
+                } else {
+                    0
+                },
+                template_length,
+                read_length,
+            });
         }
 
-        self.update_dicts(record, pos, key, barcode.umi);
-        Ok(out)
+        self.file(
+            record,
+            pos,
+            SlotKey::new(coordinate, barcode.cell, &barcode.umi),
+        )
     }
 
     /// Flushes every remaining bundle
     /// (Python source: the trailing `for p in sorted(self.reads_dict.keys())`
     /// loop after `get_bundles.__call__`'s main loop).
-    #[must_use]
-    pub fn finish(&mut self) -> Vec<BundleItem> {
-        let keys: Vec<PositionKey> = self.reads_dict.keys().cloned().collect();
-        self.flush(&keys)
+    pub fn finish(&mut self) -> Ready<'_> {
+        while let Some((position, slots)) = self.reads_dict.pop_first() {
+            self.ready.push_back(Queued::Position(position, slots));
+        }
+        Ready { bundler: self }
+    }
+}
+
+/// The items a [`GetBundles::push`] or [`GetBundles::finish`] made ready.
+pub struct Ready<'a> {
+    bundler: &'a mut GetBundles,
+}
+
+impl Iterator for Ready<'_> {
+    type Item = BundleItem;
+
+    fn next(&mut self) -> Option<BundleItem> {
+        self.bundler.next_ready()
+    }
+}
+
+#[derive(Debug)]
+enum Queued {
+    Single(BamRecord),
+    Position(PositionKey, PositionSlots),
+}
+
+#[derive(Debug)]
+struct Emitting {
+    gene: Option<String>,
+    entries: std::iter::Peekable<std::vec::IntoIter<(SlotKey, Slot)>>,
+}
+
+impl Emitting {
+    fn new(position: PositionKey, slots: PositionSlots) -> Self {
+        let gene = match position {
+            PositionKey::Gene(gene) => Some(gene),
+            PositionKey::Coordinate(_) => None,
+        };
+        let mut entries: Vec<(SlotKey, Slot)> = slots.into_iter().collect();
+        // Stable, so each key's UMIs stay in first-seen order.
+        entries.sort_by(|(a, _), (b, _)| (a.coordinate, a.cell()).cmp(&(b.coordinate, b.cell())));
+        Self {
+            gene,
+            entries: entries.into_iter().peekable(),
+        }
+    }
+
+    fn next_bundle(&mut self) -> Option<BundleItem> {
+        let (first, slot) = self.entries.next()?;
+        let mut bundle = Bundle::with_capacity(1);
+        bundle.insert(
+            first.umi().to_vec(),
+            BundleEntry {
+                reads: slot.reads,
+                count: slot.count,
+            },
+        );
+        while let Some((next, slot)) = self
+            .entries
+            .next_if(|(next, _)| next.coordinate == first.coordinate && next.cell() == first.cell())
+        {
+            bundle.insert(
+                next.umi().to_vec(),
+                BundleEntry {
+                    reads: slot.reads,
+                    count: slot.count,
+                },
+            );
+        }
+        Some(BundleItem::Bundle {
+            bundle,
+            key: BundleKey {
+                gene: self.gene.clone(),
+                coordinate: first.coordinate,
+                cell: first.cell().map(<[u8]>::to_vec),
+            },
+        })
     }
 }
 
@@ -895,6 +1010,22 @@ mod tests {
     use noodles_sam::alignment::record::cigar::op::{Kind, Op};
     use noodles_sam::alignment::record::Flags;
     use noodles_sam::alignment::record_buf::Cigar as CigarBuf;
+    use noodles_sam::alignment::RecordBuf;
+    use noodles_sam::header::record::value::{map::ReferenceSequence, Map};
+    use std::num::NonZeroUsize;
+
+    fn on(r: RecordBuf, contig: &str) -> BamRecord {
+        let mut header = noodles_sam::Header::builder();
+        for name in ["chr1", "chr2"] {
+            header = header.add_reference_sequence(
+                name,
+                Map::<ReferenceSequence>::new(NonZeroUsize::new(10_000_000).unwrap()),
+            );
+        }
+        let mut r = r;
+        *r.reference_sequence_id_mut() = Some(usize::from(contig == "chr2"));
+        BamRecord::from_alignment_record(&header.build(), &r).unwrap()
+    }
 
     /// A mapped read. `RecordBuf::default()` sets `Flags::UNMAPPED`, so the
     /// flags must be cleared explicitly or every record takes the
@@ -928,10 +1059,13 @@ mod tests {
     fn reads_at_one_position_form_one_bundle() {
         let mut b = bundler(BundleFlags::default());
         for name in ["r1_AAAA", "r2_AAAA", "r3_CCCC"] {
-            let out = b.push(read(name, 101, 30), Some("chr1")).unwrap();
+            let out = b
+                .push(on(read(name, 101, 30), "chr1"), Some("chr1"))
+                .unwrap()
+                .collect::<Vec<_>>();
             assert!(out.is_empty(), "nothing should flush yet");
         }
-        let items = b.finish();
+        let items = b.finish().collect::<Vec<_>>();
         assert_eq!(items.len(), 1);
         let BundleItem::Bundle { bundle, .. } = &items[0] else {
             panic!("expected a bundle");
@@ -946,11 +1080,15 @@ mod tests {
     fn moving_past_the_flush_margin_emits_the_bundle() {
         let mut b = bundler(BundleFlags::default());
         assert!(b
-            .push(read("r1_AAAA", 101, 30), Some("chr1"))
+            .push(on(read("r1_AAAA", 101, 30), "chr1"), Some("chr1"))
             .unwrap()
+            .collect::<Vec<_>>()
             .is_empty());
         // 2000 bases later: the first position can no longer gain reads.
-        let out = b.push(read("r2_CCCC", 2101, 30), Some("chr1")).unwrap();
+        let out = b
+            .push(on(read("r2_CCCC", 2101, 30), "chr1"), Some("chr1"))
+            .unwrap()
+            .collect::<Vec<_>>();
         assert_eq!(out.len(), 1);
         assert!(matches!(&out[0], BundleItem::Bundle { bundle, .. }
             if bundle.contains_key(&b"AAAA".to_vec())));
@@ -959,19 +1097,30 @@ mod tests {
     #[test]
     fn a_contig_change_flushes_everything() {
         let mut b = bundler(BundleFlags::default());
-        b.push(read("r1_AAAA", 101, 30), Some("chr1")).unwrap();
-        let out = b.push(read("r2_CCCC", 101, 30), Some("chr2")).unwrap();
+        b.push(on(read("r1_AAAA", 101, 30), "chr1"), Some("chr1"))
+            .unwrap()
+            .for_each(drop);
+        let out = b
+            .push(on(read("r2_CCCC", 101, 30), "chr2"), Some("chr2"))
+            .unwrap()
+            .collect::<Vec<_>>();
         assert_eq!(out.len(), 1);
     }
 
     #[test]
     fn higher_mapping_quality_wins() {
         let mut b = bundler(BundleFlags::default());
-        b.push(read("low_AAAA", 101, 10), Some("chr1")).unwrap();
-        b.push(read("high_AAAA", 101, 40), Some("chr1")).unwrap();
-        b.push(read("mid_AAAA", 101, 20), Some("chr1")).unwrap();
+        b.push(on(read("low_AAAA", 101, 10), "chr1"), Some("chr1"))
+            .unwrap()
+            .for_each(drop);
+        b.push(on(read("high_AAAA", 101, 40), "chr1"), Some("chr1"))
+            .unwrap()
+            .for_each(drop);
+        b.push(on(read("mid_AAAA", 101, 20), "chr1"), Some("chr1"))
+            .unwrap()
+            .for_each(drop);
 
-        let items = b.finish();
+        let items = b.finish().collect::<Vec<_>>();
         let BundleItem::Bundle { bundle, .. } = &items[0] else {
             panic!("expected a bundle");
         };
@@ -987,9 +1136,11 @@ mod tests {
             ..BundleFlags::default()
         });
         for name in ["r1_AAAA", "r2_AAAA"] {
-            b.push(read(name, 101, 30), Some("chr1")).unwrap();
+            b.push(on(read(name, 101, 30), "chr1"), Some("chr1"))
+                .unwrap()
+                .for_each(drop);
         }
-        let items = b.finish();
+        let items = b.finish().collect::<Vec<_>>();
         let BundleItem::Bundle { bundle, .. } = &items[0] else {
             panic!("expected a bundle");
         };
@@ -1003,9 +1154,11 @@ mod tests {
             ..BundleFlags::default()
         });
         for name in ["r1_AAAA", "r2_AAAA"] {
-            b.push(read(name, 101, 30), Some("chr1")).unwrap();
+            b.push(on(read(name, 101, 30), "chr1"), Some("chr1"))
+                .unwrap()
+                .for_each(drop);
         }
-        let items = b.finish();
+        let items = b.finish().collect::<Vec<_>>();
         let BundleItem::Bundle { bundle, .. } = &items[0] else {
             panic!("expected a bundle");
         };
@@ -1019,14 +1172,21 @@ mod tests {
         *r.flags_mut() = Flags::SEGMENTED | Flags::LAST_SEGMENT;
 
         let mut b = bundler(BundleFlags::default());
-        assert!(b.push(r.clone(), Some("chr1")).unwrap().is_empty());
+        assert!(b
+            .push(on(r.clone(), "chr1"), Some("chr1"))
+            .unwrap()
+            .collect::<Vec<_>>()
+            .is_empty());
         assert!(!b.read_events().contains_key("Input Reads"));
 
         let mut b = bundler(BundleFlags {
             return_read2: true,
             ..BundleFlags::default()
         });
-        let out = b.push(r, Some("chr1")).unwrap();
+        let out = b
+            .push(on(r, "chr1"), Some("chr1"))
+            .unwrap()
+            .collect::<Vec<_>>();
         assert_eq!(out.len(), 1);
         assert!(matches!(out[0], BundleItem::Single(_)));
     }
@@ -1037,14 +1197,21 @@ mod tests {
         *r.flags_mut() = Flags::UNMAPPED;
 
         let mut b = bundler(BundleFlags::default());
-        assert!(b.push(r.clone(), Some("chr1")).unwrap().is_empty());
+        assert!(b
+            .push(on(r.clone(), "chr1"), Some("chr1"))
+            .unwrap()
+            .collect::<Vec<_>>()
+            .is_empty());
         assert_eq!(b.read_events()["Single end unmapped"], 1);
 
         let mut b = bundler(BundleFlags {
             return_unmapped: true,
             ..BundleFlags::default()
         });
-        let out = b.push(r, Some("chr1")).unwrap();
+        let out = b
+            .push(on(r, "chr1"), Some("chr1"))
+            .unwrap()
+            .collect::<Vec<_>>();
         assert_eq!(out.len(), 1);
         // Python counts 'Input Reads' twice on this path; see the comment in
         // `push`.
@@ -1066,9 +1233,11 @@ mod tests {
                 sep: "_".to_string(),
             },
         );
-        b.push(read("low_AAAA", 101, 10), Some("chr1")).unwrap();
+        b.push(on(read("low_AAAA", 101, 10), "chr1"), Some("chr1"))
+            .unwrap()
+            .for_each(drop);
         assert_eq!(b.read_events()["< MAPQ threshold"], 1);
-        assert!(b.finish().is_empty());
+        assert!(b.finish().collect::<Vec<_>>().is_empty());
     }
 
     /// A record with MAPQ 255 ("not available") must pass a threshold of 20,
@@ -1093,22 +1262,26 @@ mod tests {
         );
         let mut r = read("r1_AAAA", 101, 0);
         *r.mapping_quality_mut() = None;
-        b.push(r, Some("chr1")).unwrap();
+        b.push(on(r, "chr1"), Some("chr1")).unwrap().for_each(drop);
         assert!(!b.read_events().contains_key("< MAPQ threshold"));
-        assert_eq!(b.finish().len(), 1);
+        assert_eq!(b.finish().collect::<Vec<_>>().len(), 1);
     }
 
     #[test]
     fn strand_separates_bundles() {
         let mut b = bundler(BundleFlags::default());
-        b.push(read("fwd_AAAA", 101, 30), Some("chr1")).unwrap();
+        b.push(on(read("fwd_AAAA", 101, 30), "chr1"), Some("chr1"))
+            .unwrap()
+            .for_each(drop);
         let mut rev = read("rev_AAAA", 101, 30);
         *rev.flags_mut() = Flags::REVERSE_COMPLEMENTED;
-        b.push(rev, Some("chr1")).unwrap();
+        b.push(on(rev, "chr1"), Some("chr1"))
+            .unwrap()
+            .for_each(drop);
 
         // Forward groups at pos 100, reverse at pos 150 — different positions
         // as well as different keys.
-        let items = b.finish();
+        let items = b.finish().collect::<Vec<_>>();
         assert_eq!(items.len(), 2);
     }
 
@@ -1127,11 +1300,13 @@ mod tests {
                 sep: "_".to_string(),
             },
         );
-        b.push(read("r1_CELL1_AAAA", 101, 30), Some("chr1"))
-            .unwrap();
-        b.push(read("r2_CELL2_AAAA", 101, 30), Some("chr1"))
-            .unwrap();
-        let items = b.finish();
+        b.push(on(read("r1_CELL1_AAAA", 101, 30), "chr1"), Some("chr1"))
+            .unwrap()
+            .for_each(drop);
+        b.push(on(read("r2_CELL2_AAAA", 101, 30), "chr1"), Some("chr1"))
+            .unwrap()
+            .for_each(drop);
+        let items = b.finish().collect::<Vec<_>>();
         assert_eq!(items.len(), 2);
         for item in &items {
             let BundleItem::Bundle { key, .. } = item else {
@@ -1158,9 +1333,11 @@ mod tests {
                 },
             );
             for n in names {
-                b.push(read(n, 101, 30), Some("chr1")).unwrap();
+                b.push(on(read(n, 101, 30), "chr1"), Some("chr1"))
+                    .unwrap()
+                    .for_each(drop);
             }
-            let items = b.finish();
+            let items = b.finish().collect::<Vec<_>>();
             let BundleItem::Bundle { bundle, .. } = &items[0] else {
                 panic!("expected a bundle");
             };
@@ -1187,12 +1364,149 @@ mod tests {
             BarcodeGetter::Tag(crate::sam::TagConfig::default()),
         );
         // No RX tag on this record.
-        b.push(read("r1", 101, 30), Some("chr1")).unwrap();
+        b.push(on(read("r1", 101, 30), "chr1"), Some("chr1"))
+            .unwrap()
+            .for_each(drop);
         assert_eq!(
             b.read_events()["Read skipped, missing umi and/or cell tag"],
             1
         );
-        assert!(b.finish().is_empty());
+        assert!(b.finish().collect::<Vec<_>>().is_empty());
+    }
+
+    fn with_nh(mut r: RecordBuf, nh: u8) -> RecordBuf {
+        use noodles_sam::alignment::record::data::field::Tag;
+        use noodles_sam::alignment::record_buf::data::field::Value;
+        r.data_mut().insert(Tag::from(*b"NH"), Value::UInt8(nh));
+        r
+    }
+
+    fn read_id_bundler(options: &BundleOptions) -> GetBundles {
+        GetBundles::new(
+            options,
+            BundleFlags::default(),
+            BarcodeGetter::ReadId {
+                cell_barcode: false,
+                sep: "_".to_string(),
+            },
+        )
+    }
+
+    #[test]
+    fn a_better_multimapping_tag_replaces_and_still_draws() {
+        let options = BundleOptions {
+            detection_method: Some(DetectionMethod::Nh),
+            random_seed: Some(3),
+            ..BundleOptions::default()
+        };
+        let mut rng = crate::mersenne::MersenneTwister::seed_from_u64(3);
+        let _consumed_by_b = rng.random();
+        let c_wins = rng.random() < 0.5;
+
+        let mut b = read_id_bundler(&options);
+        for (name, nh) in [("a_AAAA", 2), ("b_AAAA", 1), ("c_AAAA", 1)] {
+            b.push(on(with_nh(read(name, 101, 30), nh), "chr1"), Some("chr1"))
+                .unwrap()
+                .for_each(drop);
+        }
+        let items = b.finish().collect::<Vec<_>>();
+        let BundleItem::Bundle { bundle, .. } = &items[0] else {
+            panic!("expected a bundle");
+        };
+        let kept = bundle[&b"AAAA".to_vec()]
+            .reads
+            .one()
+            .unwrap()
+            .name()
+            .unwrap();
+        assert_eq!(
+            kept,
+            if c_wins {
+                &b"c_AAAA"[..]
+            } else {
+                &b"b_AAAA"[..]
+            }
+        );
+    }
+
+    #[test]
+    fn spliced_reads_are_keyed_by_where_the_splice_starts() {
+        let options = BundleOptions {
+            spliced: true,
+            random_seed: Some(1),
+            ..BundleOptions::default()
+        };
+        let mut b = read_id_bundler(&options);
+        for (name, ops) in [
+            (
+                "a_AAAA",
+                vec![
+                    Op::new(Kind::Match, 10),
+                    Op::new(Kind::Skip, 100),
+                    Op::new(Kind::Match, 40),
+                ],
+            ),
+            (
+                "b_AAAA",
+                vec![
+                    Op::new(Kind::Match, 20),
+                    Op::new(Kind::Skip, 100),
+                    Op::new(Kind::Match, 30),
+                ],
+            ),
+            (
+                "c_AAAA",
+                vec![
+                    Op::new(Kind::Match, 20),
+                    Op::new(Kind::Skip, 50),
+                    Op::new(Kind::Match, 30),
+                ],
+            ),
+        ] {
+            let mut r = read(name, 101, 30);
+            *r.cigar_mut() = ops.into_iter().collect::<CigarBuf>();
+            b.push(on(r, "chr1"), Some("chr1")).unwrap().for_each(drop);
+        }
+        let splices: Vec<usize> = b
+            .finish()
+            .map(|item| match item {
+                BundleItem::Bundle { key, .. } => key.coordinate.unwrap().spliced,
+                BundleItem::Single(_) => panic!("expected bundles"),
+            })
+            .collect();
+        assert_eq!(splices, vec![10, 20]);
+    }
+
+    #[test]
+    fn a_subset_of_zero_keeps_every_read() {
+        let options = BundleOptions {
+            subset: Some(0.0),
+            random_seed: Some(1),
+            ..BundleOptions::default()
+        };
+        let mut b = read_id_bundler(&options);
+        b.push(on(read("a_AAAA", 101, 30), "chr1"), Some("chr1"))
+            .unwrap()
+            .for_each(drop);
+        assert!(!b.read_events().contains_key("Randomly excluded"));
+        assert_eq!(b.finish().count(), 1);
+    }
+
+    #[test]
+    fn output_unpaired_reads_are_also_bundled() {
+        let options = BundleOptions {
+            paired: true,
+            unpaired_reads: UnpairedReads::Output,
+            random_seed: Some(1),
+            ..BundleOptions::default()
+        };
+        let mut b = read_id_bundler(&options);
+        let out = b
+            .push(on(read("a_AAAA", 101, 30), "chr1"), Some("chr1"))
+            .unwrap()
+            .collect::<Vec<_>>();
+        assert!(matches!(out[..], [BundleItem::Single(_)]));
+        assert_eq!(b.finish().count(), 1);
     }
 
     #[test]
@@ -1210,11 +1524,19 @@ mod tests {
                 sep: "_".to_string(),
             },
         );
-        b.push(read("r1_AAAA", 101, 30), Some("chr1")).unwrap();
+        b.push(on(read("r1_AAAA", 101, 30), "chr1"), Some("chr1"))
+            .unwrap()
+            .for_each(drop);
         // Far past the flush margin, but the same contig: nothing flushes.
-        let out = b.push(read("r2_CCCC", 999_101, 30), Some("chr1")).unwrap();
+        let out = b
+            .push(on(read("r2_CCCC", 999_101, 30), "chr1"), Some("chr1"))
+            .unwrap()
+            .collect::<Vec<_>>();
         assert!(out.is_empty());
-        let out = b.push(read("r3_GGGG", 101, 30), Some("chr2")).unwrap();
+        let out = b
+            .push(on(read("r3_GGGG", 101, 30), "chr2"), Some("chr2"))
+            .unwrap()
+            .collect::<Vec<_>>();
         assert_eq!(out.len(), 2);
     }
 }

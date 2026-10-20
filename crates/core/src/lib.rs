@@ -99,6 +99,7 @@ pub mod network;
 pub mod numeric;
 pub mod options;
 pub mod pattern;
+pub mod record;
 pub mod sam;
 pub mod stats;
 pub mod umi_methods;
@@ -110,6 +111,7 @@ pub use distance::{edit_distance, edit_distance_f64, within_threshold};
 pub use error::{PortError, Result};
 pub use extract::{ExtractConfig, ExtractFilterAndUpdate};
 pub use network::{CellClusterer, ClusterMethod, ReadDeduplicator, UmiClusterer};
+pub use record::BamRecord;
 pub use umi_methods::{FastqIterator, JoinedFastqIterator, Record};
 pub use whitelist::{knee_estimate_density, knee_estimate_distance, KneeResult};
 

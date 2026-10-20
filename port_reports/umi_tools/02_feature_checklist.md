@@ -132,7 +132,7 @@ Step-7 design; `rng` = non-deterministic; `float` = numerically sensitive;
 | `get_barcode_umis` | `sam_methods.py` | `core::sam::get_barcode_umis` | | validated |
 | `get_gene_count_tab` | `sam_methods.py` | `core::sam::get_gene_count_tab` | io | validated |
 | `getMetaContig2contig` | `sam_methods.py` | `core::sam::get_metacontig2contig` | io | validated |
-| `metafetcher` | `sam_methods.py` | `core::sam::metafetcher` | io | validated |
+| `metafetcher` | `sam_methods.py` | `core::sam::metafetch` (`MetaFetcher`) | io | validated |
 | `find_splice` | `sam_methods.py` | `core::sam::find_splice` | | validated |
 | `get_read_position` | `sam_methods.py` | `core::sam::get_read_position` | | validated |
 | `get_bundles` | `sam_methods.py` | `core::sam::GetBundles` | dyn, rng, io | validated |

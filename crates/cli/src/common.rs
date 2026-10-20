@@ -9,7 +9,9 @@
 
 use std::path::Path;
 
-use umi_tools_core::alignment::{open_input_alignments, OpenedAlignment};
+use umi_tools_core::alignment::{
+    open_input_alignments, AlignmentSink, AlignmentSource, OpenedAlignment,
+};
 use umi_tools_core::bundles::{BundleFlags, GetBundles};
 use umi_tools_core::options::{BundleOptions, IoOptions, UmiMethod};
 use umi_tools_core::sam::{BarcodeGetter, TagConfig};
@@ -88,6 +90,114 @@ pub fn open_input(io: &IoOptions) -> Result<OpenedAlignment> {
     open_input_alignments(path, format, io.reference_filename.as_deref())
 }
 
+/// Describes the `-I/--stdin` input, for side passes that reopen it.
+pub fn input_source(io: &IoOptions) -> Result<AlignmentSource> {
+    let path = io
+        .stdin
+        .clone()
+        .ok_or_else(|| PortError::value("Input on standard in not currently supported"))?;
+    let format = determine_format(&path.to_string_lossy(), io.in_sam, io.in_format);
+    Ok(AlignmentSource {
+        path,
+        format,
+        reference: io.reference_filename.clone(),
+    })
+}
+
+/// Opens where `dedup` and `group` write their reads, coordinate-sorted
+/// unless `--no-sort-output` (Python source: `Utilities.sort_output`).
+pub fn open_output(io: &IoOptions, input: &OpenedAlignment) -> Result<AlignmentSink> {
+    let eventual = io
+        .stdout
+        .as_ref()
+        .map_or_else(|| "-".to_string(), |p| p.to_string_lossy().into_owned());
+    AlignmentSink::open(
+        io.stdout.as_deref(),
+        determine_format(&eventual, io.out_sam, io.out_format),
+        &input.header,
+        input.header_text(),
+        io.reference_filename.as_deref(),
+        !io.no_sort_output,
+        io.tmpdir.as_deref(),
+    )
+}
+
+/// What the main pass reads (Python source: `inreads`).
+#[derive(Debug, Clone)]
+pub enum Input {
+    /// `infile.fetch()`, or `fetch(until_eof=True)`.
+    Fetch {
+        /// Include the unplaced reads at the end.
+        until_eof: bool,
+    },
+    /// `infile.fetch(reference=options.chrom)`: one reference, by index.
+    Chrom(usize),
+    /// `metafetcher(infile, metacontig2contig, "MC")`.
+    Meta(umi_tools_core::sam::MetaContigMap),
+}
+
+/// Chooses the main pass's input as Python does: `--chrom`, then
+/// `--gene-transcript-map`, then the whole file.
+pub fn input(
+    io: &IoOptions,
+    gene_transcript_map: Option<&Path>,
+    header: &noodles_sam::Header,
+    until_eof: bool,
+) -> Result<Input> {
+    let names = reference_names(header);
+    if let Some(chrom) = &io.chrom {
+        return names
+            .iter()
+            .position(|n| n == chrom)
+            .map(Input::Chrom)
+            .ok_or_else(|| PortError::value(format!("invalid contig `{chrom}`")));
+    }
+    if let Some(map) = gene_transcript_map {
+        let references = names.into_iter().collect();
+        return Ok(Input::Meta(umi_tools_core::sam::get_metacontig2contig(
+            &references,
+            map,
+        )?));
+    }
+    Ok(Input::Fetch { until_eof })
+}
+
+/// Feeds every record of `input` to `each`, in order.
+pub fn for_each_record(
+    opened: &mut OpenedAlignment,
+    input: &Input,
+    mut each: impl FnMut(umi_tools_core::BamRecord) -> Result<()>,
+) -> Result<()> {
+    match input {
+        Input::Fetch { until_eof } => {
+            for record in opened.records(*until_eof) {
+                each(record?)?;
+            }
+        }
+        Input::Chrom(id) => {
+            for record in opened.fetch_reference(*id)? {
+                each(record?)?;
+            }
+        }
+        Input::Meta(map) => {
+            for record in umi_tools_core::sam::metafetch(opened, map, *b"MC")? {
+                each(record?)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The header's reference-sequence names, indexed by reference id.
+#[must_use]
+pub fn reference_names(header: &noodles_sam::Header) -> Vec<String> {
+    header
+        .reference_sequences()
+        .keys()
+        .map(|k| String::from_utf8_lossy(k.as_ref()).into_owned())
+        .collect()
+}
+
 /// Builds a bundler over an opened alignment.
 ///
 /// # Errors
@@ -131,6 +241,53 @@ pub fn log_cluster_stats(positions: u64, total_umis: u64, max_umis: usize) {
         ));
     } else {
         utilities::warn("The BAM did not contain any valid reads/read pairs for deduplication");
+    }
+}
+
+/// A text destination: `-S/--stdout`, or standard output.
+pub enum TextOutput {
+    /// The `-S` file, gzip-compressed if its name ends in `.gz`.
+    File(Box<umi_tools_core::utilities::OutputFile>),
+    /// Standard output.
+    Stdout(std::io::BufWriter<std::io::Stdout>),
+}
+
+impl std::io::Write for TextOutput {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            TextOutput::File(f) => f.write(buf),
+            TextOutput::Stdout(w) => w.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            TextOutput::File(f) => f.flush(),
+            TextOutput::Stdout(w) => w.flush(),
+        }
+    }
+}
+
+impl TextOutput {
+    /// Flushes and closes the destination.
+    pub fn finish(self) -> Result<()> {
+        use std::io::Write as _;
+        match self {
+            TextOutput::File(f) => f.finish(),
+            TextOutput::Stdout(mut w) => w.flush().map_err(io_error),
+        }
+    }
+}
+
+/// Opens `path`, or standard output if `None`.
+pub fn open_text_output(path: Option<&Path>) -> Result<TextOutput> {
+    match path {
+        Some(p) => Ok(TextOutput::File(Box::new(utilities::create_file(
+            p, false,
+        )?))),
+        None => Ok(TextOutput::Stdout(std::io::BufWriter::new(
+            std::io::stdout(),
+        ))),
     }
 }
 

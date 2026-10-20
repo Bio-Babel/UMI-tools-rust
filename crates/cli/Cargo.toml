@@ -21,6 +21,7 @@ path = "src/main.rs"
 [dependencies]
 umi_tools-core.workspace = true
 clap.workspace = true
+indexmap.workspace = true
 noodles-core.workspace = true
 noodles-sam.workspace = true
 noodles-bam.workspace = true

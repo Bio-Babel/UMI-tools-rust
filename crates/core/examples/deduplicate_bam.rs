@@ -40,8 +40,7 @@ fn main() -> Result<(), PortError> {
     println!("Reading {}", input.display());
 
     let mut opened = open_input_alignments(&input, AlignmentFormat::Bam, None)?;
-    let records = opened.read_all()?;
-    println!("{} alignment records\n", records.len());
+    let reference_names = opened.reference_names();
 
     // The UMI is appended to the read name by `umi_tools extract`, separated
     // by an underscore — the layout `extract_barcodes.rs` produces.
@@ -66,7 +65,7 @@ fn main() -> Result<(), PortError> {
 
     // Bundles are emitted as the scan passes them, so memory stays bounded
     // however large the input is.
-    let handle = |items: Vec<BundleItem>,
+    let handle = |items: &mut dyn Iterator<Item = BundleItem>,
                   deduplicator: &mut ReadDeduplicator,
                   reads_in: &mut u64,
                   reads_out: &mut u64,
@@ -109,11 +108,14 @@ fn main() -> Result<(), PortError> {
         Ok(())
     };
 
-    for record in umi_tools_core::alignment::fetch(&records, false) {
-        let reference_name = opened.reference_name(record);
-        let items = bundler.push(record.clone(), reference_name.as_deref())?;
+    for record in opened.records(false) {
+        let record = record?;
+        let reference_name = record
+            .reference_id()
+            .and_then(|id| reference_names.get(id))
+            .map(String::as_str);
         handle(
-            items,
+            &mut bundler.push(record, reference_name)?,
             &mut deduplicator,
             &mut reads_in,
             &mut reads_out,
@@ -121,7 +123,7 @@ fn main() -> Result<(), PortError> {
         )?;
     }
     handle(
-        bundler.finish(),
+        &mut bundler.finish(),
         &mut deduplicator,
         &mut reads_in,
         &mut reads_out,

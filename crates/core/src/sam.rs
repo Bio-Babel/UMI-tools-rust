@@ -6,21 +6,19 @@
 //! `--extract-umi-method`: appended to the read name by `umi_tools extract`,
 //! in a SAM tag written by an aligner or a 10x pipeline, or in the
 //! `umis`-style `:UMI_<seq>:` read-name convention.
-//!
-//! The Python original uses `pysam`; this module uses `noodles`, whose
-//! `RecordBuf` is the domain-standard owned SAM/BAM/CRAM record. The accessor
-//! mapping is tabulated in `port_reports/umi_tools/07_translation_log.md`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+
+use indexmap::{IndexMap, IndexSet};
 use std::io::BufRead;
 use std::path::Path;
 
 use noodles_sam::alignment::record::cigar::op::Kind;
-use noodles_sam::alignment::record::data::field::Tag;
-use noodles_sam::alignment::record_buf::data::field::Value;
-use noodles_sam::alignment::RecordBuf;
+use noodles_sam::alignment::record::data::field::Value;
 
+use crate::alignment::{AlignmentSink, AlignmentSource, BamRecord, OpenedAlignment, ReferenceScan};
 use crate::error::{PortError, Result};
+use crate::record::TagValue;
 use crate::utilities;
 
 /// The raw mapping quality byte, as `pysam`'s `read.mapping_quality` reports it.
@@ -39,14 +37,16 @@ use crate::utilities;
 /// # Examples
 ///
 /// ```
-/// use noodles_sam::alignment::RecordBuf;
-/// use umi_tools_core::sam::raw_mapping_quality;
+/// use noodles_sam::{alignment::RecordBuf, Header};
+/// use umi_tools_core::{sam::raw_mapping_quality, BamRecord};
 /// // A record with no mapping quality set reads back as 255, not 0.
-/// assert_eq!(raw_mapping_quality(&RecordBuf::default()), 255);
+/// let record = BamRecord::from_alignment_record(&Header::default(), &RecordBuf::default())?;
+/// assert_eq!(raw_mapping_quality(&record), 255);
+/// # Ok::<(), std::io::Error>(())
 /// ```
 #[must_use]
-pub fn raw_mapping_quality(record: &RecordBuf) -> u8 {
-    record.mapping_quality().map_or(255, u8::from)
+pub fn raw_mapping_quality(record: &BamRecord) -> u8 {
+    record.mapping_quality()
 }
 
 /// A UMI and, optionally, the cell barcode it was found with
@@ -148,11 +148,16 @@ impl Default for TagConfig {
 ///
 /// Returns `None` when the tag is absent or holds an array, which has no
 /// single textual value.
-#[must_use]
-pub fn tag_text(record: &RecordBuf, tag: [u8; 2]) -> Option<String> {
-    match record.data().get(&Tag::from(tag))? {
+pub fn tag_text(record: &BamRecord, tag: [u8; 2]) -> Result<Option<String>> {
+    let view = record.view();
+    let data = view.data();
+    let Some(value) = data.get(&tag) else {
+        return Ok(None);
+    };
+    let value = value.map_err(|e| PortError::alignment(e.to_string()))?;
+    Ok(match value {
         Value::String(s) | Value::Hex(s) => Some(String::from_utf8_lossy(s.as_ref()).into_owned()),
-        Value::Character(c) => Some((*c as char).to_string()),
+        Value::Character(c) => Some((c as char).to_string()),
         Value::Int8(v) => Some(v.to_string()),
         Value::UInt8(v) => Some(v.to_string()),
         Value::Int16(v) => Some(v.to_string()),
@@ -161,7 +166,7 @@ pub fn tag_text(record: &RecordBuf, tag: [u8; 2]) -> Option<String> {
         Value::UInt32(v) => Some(v.to_string()),
         Value::Float(v) => Some(v.to_string()),
         Value::Array(_) => None,
-    }
+    })
 }
 
 fn apply_split_and_delim(value: String, split: Option<&String>, delim: Option<&String>) -> String {
@@ -192,14 +197,14 @@ fn apply_split_and_delim(value: String, split: Option<&String>, delim: Option<&S
 /// Python, whose `read.get_tag` raises `KeyError` — which the callers in
 /// [`crate::bundles`] catch to count "Read skipped, missing umi and/or cell
 /// tag", exactly as Python does.
-pub fn get_barcode_tag(record: &RecordBuf, config: &TagConfig) -> Result<Barcode> {
+pub fn get_barcode_tag(record: &BamRecord, config: &TagConfig) -> Result<Barcode> {
     let missing = |what: &str| {
         PortError::value(format!(
             "Could not extract UMI +/- cell barcode from the read tag: {what} not present"
         ))
     };
 
-    let raw_umi = tag_text(record, config.umi_tag)
+    let raw_umi = tag_text(record, config.umi_tag)?
         .ok_or_else(|| missing(&String::from_utf8_lossy(&config.umi_tag)))?;
     let umi = apply_split_and_delim(
         raw_umi,
@@ -211,7 +216,7 @@ pub fn get_barcode_tag(record: &RecordBuf, config: &TagConfig) -> Result<Barcode
         let cell_tag = config
             .cell_tag
             .ok_or_else(|| PortError::value("Need to supply the --cell-tag option"))?;
-        let raw = tag_text(record, cell_tag)
+        let raw = tag_text(record, cell_tag)?
             .ok_or_else(|| missing(&String::from_utf8_lossy(&cell_tag)))?;
         // Python guards the post-processing with `if cell and ...`, so an
         // empty cell barcode is passed through untouched.
@@ -343,17 +348,14 @@ impl BarcodeGetter {
     /// # Errors
     ///
     /// Propagates the underlying getter's errors.
-    pub fn get(&self, record: &RecordBuf) -> Result<Barcode> {
-        let name = record
-            .name()
-            .map(|n| String::from_utf8_lossy(n.as_ref()).into_owned())
-            .unwrap_or_default();
+    pub fn get(&self, record: &BamRecord) -> Result<Barcode> {
+        let name = || String::from_utf8_lossy(record.name().unwrap_or_default()).into_owned();
         match self {
             BarcodeGetter::ReadId { cell_barcode, sep } => {
-                get_barcode_read_id(&name, *cell_barcode, sep)
+                get_barcode_read_id(&name(), *cell_barcode, sep)
             }
             BarcodeGetter::Tag(config) => get_barcode_tag(record, config),
-            BarcodeGetter::Umis { cell_barcode } => get_barcode_umis(&name, *cell_barcode),
+            BarcodeGetter::Umis { cell_barcode } => get_barcode_umis(&name(), *cell_barcode),
         }
     }
 }
@@ -556,7 +558,10 @@ impl<R: BufRead> Iterator for GeneCountTab<R> {
 
 /// Gene to the transcripts belonging to it
 /// (Python source: the `defaultdict(set)` `getMetaContig2contig` returns).
-pub type MetaContigMap = BTreeMap<String, BTreeSet<String>>;
+///
+/// Transcripts keep the file's order; Python's `set` order varies per run,
+/// and only membership is compared.
+pub type MetaContigMap = IndexMap<String, IndexSet<String>>;
 
 /// Reads a gene-to-transcript map, keeping only transcripts present in the
 /// alignment (Python source: `sam_methods.getMetaContig2contig`).
@@ -685,33 +690,37 @@ pub struct ReadPosition {
 ///   arithmetic.
 /// - [`PortError::Value`] from [`find_splice`] for an unrecognised CIGAR
 ///   operation.
-pub fn get_read_position(record: &RecordBuf, soft_clip_threshold: usize) -> Result<ReadPosition> {
-    let cigar: Vec<(Kind, usize)> = record
+pub fn get_read_position(record: &BamRecord, soft_clip_threshold: usize) -> Result<ReadPosition> {
+    let view = record.view();
+    let cigar: Vec<(Kind, usize)> = view
         .cigar()
-        .as_ref()
         .iter()
-        .map(|op| (op.kind(), op.len()))
-        .collect();
+        .map(|op| op.map(|op| (op.kind(), op.len())))
+        .collect::<std::io::Result<_>>()
+        .map_err(|e| PortError::alignment(e.to_string()))?;
     let has_skip = cigar.iter().any(|(k, _)| *k == Kind::Skip);
 
-    let start_pos = record
-        .alignment_start()
+    let alignment_start = record
+        .position()
         .ok_or_else(|| PortError::alignment("record has no alignment start"))?;
-    // noodles positions are 1-based; pysam's `.pos`/`.aend` are 0-based, and
-    // every downstream comparison and TSV column uses the pysam convention.
-    let alignment_start = i64::try_from(usize::from(start_pos)).unwrap_or(i64::MAX) - 1;
 
     if record.flags().is_reverse_complemented() {
-        let end = record
-            .alignment_end()
-            .ok_or_else(|| PortError::alignment("record has no alignment end"))?;
-        let mut pos = i64::try_from(usize::from(end)).unwrap_or(i64::MAX);
+        let span: usize = cigar
+            .iter()
+            .filter(|(k, _)| k.consumes_reference())
+            .map(|(_, n)| n)
+            .sum();
+        let mut pos = alignment_start + i64::try_from(span).unwrap_or(i64::MAX);
+        if pos == 0 {
+            return Err(PortError::alignment("record has no alignment end"));
+        }
         if let Some(&(Kind::SoftClip, len)) = cigar.last() {
             pos += i64::try_from(len).unwrap_or(0);
         }
-        let trailing_clip = matches!(cigar.last(), Some(&(Kind::SoftClip, len))
+        // Python tests the *first* operation here, `read.cigar[0]`.
+        let leading_clip = matches!(cigar.first(), Some(&(Kind::SoftClip, len))
             if len > soft_clip_threshold);
-        let is_spliced = if has_skip || trailing_clip {
+        let is_spliced = if has_skip || leading_clip {
             // The 5-prime end of a reverse read is the right-hand end, so the
             // CIGAR is walked backwards.
             let reversed: Vec<(Kind, usize)> = cigar.iter().rev().copied().collect();
@@ -729,9 +738,9 @@ pub fn get_read_position(record: &RecordBuf, soft_clip_threshold: usize) -> Resu
         if let Some(&(Kind::SoftClip, len)) = cigar.first() {
             pos -= i64::try_from(len).unwrap_or(0);
         }
-        let leading_clip = matches!(cigar.last(), Some(&(Kind::SoftClip, len))
+        let trailing_clip = matches!(cigar.last(), Some(&(Kind::SoftClip, len))
             if len > soft_clip_threshold);
-        let is_spliced = if has_skip || leading_clip {
+        let is_spliced = if has_skip || trailing_clip {
             find_splice(&cigar)?
         } else {
             None
@@ -741,6 +750,74 @@ pub fn get_read_position(record: &RecordBuf, soft_clip_threshold: usize) -> Resu
             pos,
             is_spliced,
         })
+    }
+}
+
+/// Every read of each metacontig's contigs in turn, tagged `MC` (Python
+/// source: `sam_methods.metafetcher`); the input must be indexed.
+pub fn metafetch<'a>(
+    reader: &'a mut OpenedAlignment,
+    metacontigs: &MetaContigMap,
+    tag: [u8; 2],
+) -> Result<MetaFetcher<'a>> {
+    if !reader.has_index()? {
+        return Err(PortError::value("fetch called on bamfile without index"));
+    }
+    let ids: BTreeMap<String, usize> = reader
+        .reference_names()
+        .into_iter()
+        .enumerate()
+        .map(|(id, name)| (name, id))
+        .collect();
+    let mut plan = Vec::new();
+    for (metacontig, contigs) in metacontigs {
+        for contig in contigs {
+            if let Some(&id) = ids.get(contig) {
+                plan.push((id, metacontig.clone()));
+            }
+        }
+    }
+    Ok(MetaFetcher {
+        reader,
+        plan: plan.into_iter(),
+        current: None,
+        tag,
+    })
+}
+
+/// See [`metafetch`].
+pub struct MetaFetcher<'a> {
+    reader: &'a mut OpenedAlignment,
+    plan: std::vec::IntoIter<(usize, String)>,
+    current: Option<(ReferenceScan, String)>,
+    tag: [u8; 2],
+}
+
+impl Iterator for MetaFetcher<'_> {
+    type Item = Result<BamRecord>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some((scan, metacontig)) = self.current.as_mut() {
+                match scan.next(self.reader) {
+                    Some(Ok(mut record)) => {
+                        return Some(
+                            record
+                                .set_tag(self.tag, TagValue::String(metacontig.as_bytes()))
+                                .map(|()| record)
+                                .map_err(|e| PortError::alignment(e.to_string())),
+                        );
+                    }
+                    Some(Err(e)) => return Some(Err(e)),
+                    None => self.current = None,
+                }
+            }
+            let (id, metacontig) = self.plan.next()?;
+            match self.reader.start_reference(id) {
+                Ok(scan) => self.current = Some((scan, metacontig)),
+                Err(e) => return Some(Err(e)),
+            }
+        }
     }
 }
 
@@ -754,66 +831,44 @@ pub fn get_read_position(record: &RecordBuf, soft_clip_threshold: usize) -> Resu
 /// contig — by which point every mate on the previous contig has gone by.
 /// Whatever is still owed at the end is found in a final full pass.
 ///
+/// The passes reread the input; Python's per-contig `fetch(reference=chrom)`
+/// becomes one forward scan of a second reader, the same on sorted input.
+///
 /// # A note on `close`
 ///
 /// The Python original warns that "if `close()` is not called, at least a
 /// contig's worth of mates will be missing". Here [`close`](Self::close)
 /// consumes the writer, so forgetting it is a compile error rather than a
 /// silently truncated file.
-pub struct TwoPassPairWriter<'a> {
-    records: &'a [RecordBuf],
-    /// Reference-sequence names indexed by id, in header order.
-    reference_names: Vec<String>,
-    writer: crate::alignment::OpenedAlignmentWriter,
+pub struct TwoPassPairWriter {
+    source: AlignmentSource,
+    sink: AlignmentSink,
+    mates: Option<MateScan>,
     /// Mates still owed, keyed as Python keys them.
-    owed: std::collections::BTreeSet<MateKey>,
-    chrom: Option<String>,
-    never_found: usize,
+    owed: HashSet<MateKey>,
+    chrom: Option<usize>,
 }
 
-/// `(query name, mate reference, mate position)` — the key Python builds from
-/// `read.query_name, read.next_reference_name, read.next_reference_start`.
-type MateKey = (Vec<u8>, Option<String>, Option<usize>);
+/// Python's `(query_name, next_reference_name, next_reference_start)` of a read 1.
+type MateKey = (Box<[u8]>, Option<usize>, Option<i64>);
 
-impl<'a> TwoPassPairWriter<'a> {
-    /// Creates a writer over `records`, the same records deduplication scanned.
-    ///
-    /// Python opens a second handle on the input file for the mate passes; the
-    /// records are already in memory here, so the second handle is a second
-    /// traversal of the same slice.
-    ///
-    /// `reference_names` are the header's reference-sequence names in id
-    /// order, which is how a record's contig is resolved.
+struct MateScan {
+    reader: crate::alignment::OpenedAlignment,
+    next: Option<BamRecord>,
+    last: usize,
+}
+
+impl TwoPassPairWriter {
+    /// Creates a writer over `sink` that finds mates in `source`.
     #[must_use]
-    pub fn new(
-        records: &'a [RecordBuf],
-        reference_names: Vec<String>,
-        writer: crate::alignment::OpenedAlignmentWriter,
-    ) -> Self {
+    pub fn new(source: AlignmentSource, sink: AlignmentSink) -> Self {
         Self {
-            records,
-            reference_names,
-            writer,
-            owed: std::collections::BTreeSet::new(),
+            source,
+            sink,
+            mates: None,
+            owed: HashSet::new(),
             chrom: None,
-            never_found: 0,
         }
-    }
-
-    fn name_of(record: &RecordBuf) -> Vec<u8> {
-        record.name().map(|n| n.to_vec()).unwrap_or_default()
-    }
-
-    fn reference_of(&self, record: &RecordBuf) -> Option<String> {
-        record
-            .reference_sequence_id()
-            .and_then(|id| self.reference_names.get(id).cloned())
-    }
-
-    fn mate_reference_of(&self, record: &RecordBuf) -> Option<String> {
-        record
-            .mate_reference_sequence_id()
-            .and_then(|id| self.reference_names.get(id).cloned())
     }
 
     /// Writes one read, flushing owed mates when the contig changes
@@ -824,76 +879,86 @@ impl<'a> TwoPassPairWriter<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`PortError::Alignment`] if the record cannot be written.
-    pub fn write(&mut self, record: &RecordBuf, unmapped: bool) -> Result<()> {
+    /// Returns [`PortError::Alignment`] if the record cannot be written, or a
+    /// mate pass cannot read the input.
+    pub fn write(&mut self, record: BamRecord, unmapped: bool) -> Result<()> {
         if unmapped || record.flags().is_mate_unmapped() {
-            return self.writer.write(record);
+            return self.sink.write(record);
         }
 
-        let contig = self.reference_of(record);
+        let contig = record.reference_id();
         if self.chrom != contig {
             self.write_mates()?;
             self.chrom = contig;
         }
 
         self.owed.insert((
-            Self::name_of(record),
-            self.mate_reference_of(record),
-            record.mate_alignment_start().map(usize::from),
+            record.name().unwrap_or_default().into(),
+            record.mate_reference_id(),
+            record.mate_position(),
         ));
-        self.writer.write(record)
+        self.sink.write(record)
     }
 
-    /// Scans the current contig for the mates still owed
+    /// Writes the owed mates found on the current contig
     /// (Python source: `TwoPassPairWriter.write_mates`).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PortError::Alignment`] if a record cannot be written.
     pub fn write_mates(&mut self) -> Result<()> {
-        let Some(chrom) = self.chrom.clone() else {
+        // Python's first call scans for an empty set of mates: a no-op.
+        let Some(chrom) = self.chrom else {
             return Ok(());
         };
         utilities::debug(&format!(
             "Dumping {} mates for contig {chrom}",
             self.owed.len()
         ));
-        self.scan(Some(&chrom))?;
+
+        // Restart the scan only if a contig is revisited (unsorted input).
+        if self.mates.as_ref().is_none_or(|scan| scan.last >= chrom) {
+            self.mates = Some(MateScan {
+                reader: self.source.open()?,
+                next: None,
+                last: chrom,
+            });
+        }
+        let scan = self.mates.as_mut().expect("opened above");
+        scan.last = chrom;
+        loop {
+            let record = match scan.next.take() {
+                Some(record) => record,
+                None => match scan.reader.read_record()? {
+                    Some(record) => record,
+                    None => break,
+                },
+            };
+            match record.reference_id() {
+                Some(id) if id < chrom => {}
+                Some(id) if id == chrom => {
+                    if Self::is_owed_mate(&mut self.owed, &record) {
+                        self.sink.write(record)?;
+                    }
+                }
+                _ => {
+                    scan.next = Some(record);
+                    break;
+                }
+            }
+        }
         utilities::debug(&format!("{} mates remaining", self.owed.len()));
         Ok(())
     }
 
-    /// Writes owed mates found among records on `contig`, or among all records
-    /// when `contig` is `None`.
-    fn scan(&mut self, contig: Option<&str>) -> Result<()> {
-        let mut found: Vec<usize> = Vec::new();
-        for (index, record) in self.records.iter().enumerate() {
-            let name = self.reference_of(record);
-            if contig.is_some() && name.as_deref() != contig {
-                continue;
-            }
-            let flags = record.flags();
-            // Python skips unmapped reads, reads whose mate is unmapped, and
-            // read 1s — it is looking for read 2s to pair with retained read 1s.
-            if flags.is_unmapped()
-                || flags.is_mate_unmapped()
-                || (flags.is_segmented() && flags.is_first_segment())
-            {
-                continue;
-            }
-            let key = (
-                Self::name_of(record),
-                name,
-                record.alignment_start().map(usize::from),
-            );
-            if self.owed.remove(&key) {
-                found.push(index);
-            }
+    /// Whether `record` is a mate still owed, crossing it off if so.
+    fn is_owed_mate(owed: &mut HashSet<MateKey>, record: &BamRecord) -> bool {
+        let flags = record.flags();
+        if flags.is_unmapped() || flags.is_mate_unmapped() || flags.is_first_segment() {
+            return false;
         }
-        for index in found {
-            self.writer.write(&self.records[index])?;
-        }
-        Ok(())
+        let key: MateKey = (
+            record.name().unwrap_or_default().into(),
+            record.reference_id(),
+            record.position(),
+        );
+        owed.remove(&key)
     }
 
     /// Flushes the last contig's mates, then searches the whole file for
@@ -901,24 +966,39 @@ impl<'a> TwoPassPairWriter<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`PortError::Alignment`] if a record cannot be written or the
-    /// file cannot be finalised.
+    /// Returns [`PortError::Alignment`] if a record cannot be read or written,
+    /// or the output cannot be finalised.
     pub fn close(mut self) -> Result<()> {
         self.write_mates()?;
+        self.mates = None;
         utilities::info(&format!(
             "Searching for mates for {} unmatched alignments",
             self.owed.len()
         ));
-        self.scan(None)?;
-        self.never_found = self.owed.len();
-        utilities::info(&format!("{} mates never found", self.never_found));
-        self.writer.finish()
+        if !self.owed.is_empty() {
+            let mut reader = self.source.open()?;
+            for record in reader.records(true) {
+                let record = record?;
+                if Self::is_owed_mate(&mut self.owed, &record) {
+                    self.sink.write(record)?;
+                }
+            }
+        }
+        utilities::info(&format!("{} mates never found", self.owed.len()));
+        self.sink.finish()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use noodles_sam::alignment::record::data::field::Tag;
+    use noodles_sam::alignment::record_buf::data::field::Value;
+    use noodles_sam::alignment::RecordBuf;
+
+    fn bam(r: &RecordBuf) -> BamRecord {
+        BamRecord::from_alignment_record(&noodles_sam::Header::default(), r).unwrap()
+    }
     use noodles_core::Position;
     use noodles_sam::alignment::record::cigar::Op;
     use noodles_sam::alignment::record::Flags;
@@ -1004,7 +1084,7 @@ mod tests {
             cell_tag: Some(*b"CB"),
             ..TagConfig::default()
         };
-        let bc = get_barcode_tag(&r, &config).unwrap();
+        let bc = get_barcode_tag(&bam(&r), &config).unwrap();
         // The UMI has no split configured, so the suffix stays.
         assert_eq!(bc.umi, b"ACGT-1");
         // The cell barcode splits on the default "-", dropping the GEM well.
@@ -1014,7 +1094,7 @@ mod tests {
             umi_tag_split: Some("-".to_string()),
             ..config
         };
-        assert_eq!(get_barcode_tag(&r, &config).unwrap().umi, b"ACGT");
+        assert_eq!(get_barcode_tag(&bam(&r), &config).unwrap().umi, b"ACGT");
     }
 
     #[test]
@@ -1026,13 +1106,13 @@ mod tests {
             umi_tag_delim: Some("-".to_string()),
             ..TagConfig::default()
         };
-        assert_eq!(get_barcode_tag(&r, &config).unwrap().umi, b"ACGTTT");
+        assert_eq!(get_barcode_tag(&bam(&r), &config).unwrap().umi, b"ACGTTT");
     }
 
     #[test]
     fn missing_tag_is_an_error() {
         let r = record("read");
-        assert!(get_barcode_tag(&r, &TagConfig::default()).is_err());
+        assert!(get_barcode_tag(&bam(&r), &TagConfig::default()).is_err());
     }
 
     #[test]
@@ -1045,7 +1125,7 @@ mod tests {
             cell_tag: None,
             ..TagConfig::default()
         };
-        assert!(get_barcode_tag(&r, &config).is_err());
+        assert!(get_barcode_tag(&bam(&r), &config).is_err());
     }
 
     #[test]
@@ -1095,7 +1175,7 @@ mod tests {
     fn forward_read_position_uses_the_alignment_start() {
         // noodles is 1-based, pysam 0-based: position 101 -> pos 100.
         let r = positioned("r", 101, &[(Kind::Match, 50)], false);
-        let p = get_read_position(&r, 4).unwrap();
+        let p = get_read_position(&bam(&r), 4).unwrap();
         assert_eq!(p.pos, 100);
         assert_eq!(p.start, 100);
         assert_eq!(p.is_spliced, None);
@@ -1104,7 +1184,7 @@ mod tests {
     #[test]
     fn forward_read_position_backs_out_a_leading_soft_clip() {
         let r = positioned("r", 101, &[(Kind::SoftClip, 6), (Kind::Match, 44)], false);
-        let p = get_read_position(&r, 4).unwrap();
+        let p = get_read_position(&bam(&r), 4).unwrap();
         assert_eq!(p.pos, 94);
         assert_eq!(p.start, 94);
     }
@@ -1112,7 +1192,7 @@ mod tests {
     #[test]
     fn reverse_read_position_uses_the_alignment_end() {
         let r = positioned("r", 101, &[(Kind::Match, 50)], true);
-        let p = get_read_position(&r, 4).unwrap();
+        let p = get_read_position(&bam(&r), 4).unwrap();
         // 1-based end 150; pysam's `aend` is the 0-based half-open end, 150.
         assert_eq!(p.pos, 150);
         assert_eq!(p.start, 100);
@@ -1121,7 +1201,7 @@ mod tests {
     #[test]
     fn reverse_read_position_adds_a_trailing_soft_clip() {
         let r = positioned("r", 101, &[(Kind::Match, 44), (Kind::SoftClip, 6)], true);
-        let p = get_read_position(&r, 4).unwrap();
+        let p = get_read_position(&bam(&r), 4).unwrap();
         assert_eq!(p.pos, 150);
     }
 
@@ -1133,22 +1213,30 @@ mod tests {
             &[(Kind::Match, 20), (Kind::Skip, 100), (Kind::Match, 30)],
             false,
         );
-        assert_eq!(get_read_position(&r, 4).unwrap().is_spliced, Some(20));
+        assert_eq!(get_read_position(&bam(&r), 4).unwrap().is_spliced, Some(20));
     }
 
     #[test]
     fn a_soft_clip_under_the_threshold_is_not_a_splice() {
         let r = positioned("r", 101, &[(Kind::Match, 46), (Kind::SoftClip, 4)], false);
-        assert_eq!(get_read_position(&r, 4).unwrap().is_spliced, None);
+        assert_eq!(get_read_position(&bam(&r), 4).unwrap().is_spliced, None);
         let r = positioned("r", 101, &[(Kind::Match, 45), (Kind::SoftClip, 5)], false);
-        assert_eq!(get_read_position(&r, 4).unwrap().is_spliced, Some(45));
+        assert_eq!(get_read_position(&bam(&r), 4).unwrap().is_spliced, Some(45));
+    }
+
+    #[test]
+    fn a_reverse_read_is_spliced_by_its_leading_soft_clip() {
+        let r = positioned("r", 101, &[(Kind::SoftClip, 5), (Kind::Match, 45)], true);
+        assert_eq!(get_read_position(&bam(&r), 4).unwrap().is_spliced, Some(45));
+        let r = positioned("r", 101, &[(Kind::Match, 45), (Kind::SoftClip, 5)], true);
+        assert_eq!(get_read_position(&bam(&r), 4).unwrap().is_spliced, None);
     }
 
     #[test]
     fn unpositioned_records_are_alignment_errors() {
         let r = record("r");
         assert!(matches!(
-            get_read_position(&r, 4),
+            get_read_position(&bam(&r), 4),
             Err(PortError::Alignment(_))
         ));
     }
@@ -1234,23 +1322,101 @@ mod tests {
     }
 
     #[test]
+    fn metafetch_reads_genes_in_map_order_and_tags_them() {
+        use crate::alignment::{open_input_alignments, AlignmentSink};
+        use crate::utilities::AlignmentFormat;
+        use noodles_core::Position;
+        use noodles_sam::header::record::value::{map::ReferenceSequence, Map};
+        use std::num::NonZeroUsize;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tx.bam");
+        let mut header = noodles_sam::Header::builder();
+        for name in ["t1", "t2", "t3"] {
+            header = header.add_reference_sequence(
+                name,
+                Map::<ReferenceSequence>::new(NonZeroUsize::new(100).unwrap()),
+            );
+        }
+        let header = header.build();
+        // Sorted, so the header says so, which indexing requires.
+        let mut sink = AlignmentSink::open(
+            Some(&path),
+            AlignmentFormat::Bam,
+            &header,
+            None,
+            None,
+            true,
+            None,
+        )
+        .unwrap();
+        for (name, tid) in [("a", 0), ("b", 1), ("c", 2)] {
+            let mut r = record(name);
+            *r.flags_mut() = noodles_sam::alignment::record::Flags::empty();
+            *r.reference_sequence_id_mut() = Some(tid);
+            *r.alignment_start_mut() = Position::new(5);
+            sink.write(BamRecord::from_alignment_record(&header, &r).unwrap())
+                .unwrap();
+        }
+        sink.finish().unwrap();
+
+        let map: MetaContigMap = [
+            (
+                "g2".to_string(),
+                ["t3", "t1"].iter().map(|s| (*s).to_string()).collect(),
+            ),
+            (
+                "g1".to_string(),
+                ["t2"].iter().map(|s| (*s).to_string()).collect(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        let mut opened = open_input_alignments(&path, AlignmentFormat::Bam, None).unwrap();
+        let err = metafetch(&mut opened, &map, *b"MC").err().unwrap();
+        assert!(
+            matches!(err, PortError::Value(ref m) if m == "fetch called on bamfile without index")
+        );
+
+        let index = noodles_bam::fs::index(&path).unwrap();
+        noodles_bam::bai::fs::write(dir.path().join("tx.bam.bai"), &index).unwrap();
+        let mut opened = open_input_alignments(&path, AlignmentFormat::Bam, None).unwrap();
+        let got: Vec<(String, Option<String>)> = metafetch(&mut opened, &map, *b"MC")
+            .unwrap()
+            .map(|r| {
+                let r = r.unwrap();
+                (
+                    String::from_utf8_lossy(r.name().unwrap()).into_owned(),
+                    tag_text(&r, *b"MC").unwrap(),
+                )
+            })
+            .collect();
+        let expect = |n: &str, g: &str| (n.to_string(), Some(g.to_string()));
+        assert_eq!(
+            got,
+            vec![expect("c", "g2"), expect("a", "g2"), expect("b", "g1")]
+        );
+    }
+
+    #[test]
     fn barcode_getter_dispatch() {
         let mut r = record("read1_CELL_ACGT");
         let g = BarcodeGetter::ReadId {
             cell_barcode: true,
             sep: "_".to_string(),
         };
-        assert_eq!(g.get(&r).unwrap().umi, b"ACGT");
+        assert_eq!(g.get(&bam(&r)).unwrap().umi, b"ACGT");
 
         r.data_mut()
             .insert(Tag::from(*b"RX"), Value::String("TTTT".into()));
         let g = BarcodeGetter::Tag(TagConfig::default());
-        assert_eq!(g.get(&r).unwrap().umi, b"TTTT");
+        assert_eq!(g.get(&bam(&r)).unwrap().umi, b"TTTT");
 
         let r = record("READ:UMI_GGGG");
         let g = BarcodeGetter::Umis {
             cell_barcode: false,
         };
-        assert_eq!(g.get(&r).unwrap().umi, b"GGGG");
+        assert_eq!(g.get(&bam(&r)).unwrap().umi, b"GGGG");
     }
 }

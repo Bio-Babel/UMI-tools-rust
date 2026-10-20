@@ -9,16 +9,14 @@
 use std::io::Write;
 use std::path::Path;
 
-use umi_tools_core::alignment::open_output_alignments;
-use umi_tools_core::bundles::{BundleFlags, BundleItem};
+use umi_tools_core::alignment::AlignmentSink;
+use umi_tools_core::bundles::{BundleFlags, BundleItem, BundleReads};
 use umi_tools_core::network::UmiClusterer;
 use umi_tools_core::options::{validate_sam_options, UnmappedReads};
+use umi_tools_core::record::TagValue;
 use umi_tools_core::sam::get_read_position;
-use umi_tools_core::utilities::{self, output_names_and_formats};
+use umi_tools_core::utilities;
 use umi_tools_core::{PortError, Result};
-
-use noodles_sam::alignment::record::data::field::Tag;
-use noodles_sam::alignment::record_buf::data::field::Value;
 
 use crate::common;
 use crate::documentation;
@@ -128,8 +126,8 @@ pub fn main(args: &[String], argv: &[String]) -> Result<i32> {
             })?;
 
     let mut opened = common::open_input(&io)?;
-    let records = opened.read_all()?;
     let header = opened.header.clone();
+    let reference_names = common::reference_names(&header);
 
     // Python: `output_unmapped = options.unmapped_reads in ["use", "output"]`,
     // which also decides whether the reader runs to EOF.
@@ -138,38 +136,10 @@ pub fn main(args: &[String], argv: &[String]) -> Result<i32> {
         UnmappedReads::Use | UnmappedReads::Output
     );
 
-    let to_stdout = io.stdout.is_none();
-    let names = if output_bam || io.out_format.is_some() {
-        let eventual = io
-            .stdout
-            .as_ref()
-            .map_or_else(|| "-".to_string(), |p| p.to_string_lossy().into_owned());
-        Some(output_names_and_formats(
-            &eventual,
-            io.out_sam,
-            io.out_format,
-            io.no_sort_output,
-            io.tmpdir.as_deref(),
-        )?)
+    let mut writer: Option<AlignmentSink> = if output_bam || io.out_format.is_some() {
+        Some(common::open_output(&io, &opened)?)
     } else {
         None
-    };
-
-    let mut writer = match &names {
-        Some(names) if to_stdout && names.sorted_out_name.is_none() => {
-            Some(umi_tools_core::alignment::open_output_alignments_to_stdout(
-                names.out_format,
-                &header,
-                io.reference_filename.as_deref(),
-            )?)
-        }
-        Some(names) => Some(open_output_alignments(
-            Path::new(&names.out_name),
-            names.out_format,
-            &header,
-            io.reference_filename.as_deref(),
-        )?),
-        None => None,
     };
 
     let mut mapping_out = matches
@@ -185,11 +155,21 @@ pub fn main(args: &[String], argv: &[String]) -> Result<i32> {
         &bundle_options,
         BundleFlags {
             all_reads: true,
+            summarise_reads: writer.is_none(),
             return_read2: true,
             return_unmapped: output_unmapped,
             ..BundleFlags::default()
         },
     )?;
+    let input = common::input(
+        &io,
+        validation.gene_transcript_map.as_deref(),
+        &header,
+        output_unmapped,
+    )?;
+    if let common::Input::Meta(map) = &input {
+        bundler.with_metacontigs(map.clone());
+    }
     let mut clusterer = UmiClusterer::new(dedup_options.method);
 
     let mut n_input = 0u64;
@@ -198,9 +178,9 @@ pub fn main(args: &[String], argv: &[String]) -> Result<i32> {
     let mut input_reported = 0u64;
     let mut output_reported = 0u64;
 
-    let mut process = |items: Vec<BundleItem>,
+    let mut process = |items: &mut dyn Iterator<Item = BundleItem>,
                        clusterer: &mut UmiClusterer,
-                       writer: &mut Option<umi_tools_core::alignment::OpenedAlignmentWriter>,
+                       writer: &mut Option<AlignmentSink>,
                        mapping_out: &mut Option<umi_tools_core::utilities::OutputFile>|
      -> Result<()> {
         for item in items {
@@ -208,11 +188,11 @@ pub fn main(args: &[String], argv: &[String]) -> Result<i32> {
                 BundleItem::Single(read) => {
                     n_input += 1;
                     if let Some(w) = writer.as_mut() {
-                        w.write(&read)?;
+                        w.write(read)?;
                     }
                     n_output += 1;
                 }
-                BundleItem::Bundle { bundle, key } => {
+                BundleItem::Bundle { mut bundle, key } => {
                     let counts: umi_tools_core::network::CountMap = bundle
                         .iter()
                         .map(|(umi, entry)| (umi.clone(), entry.count))
@@ -230,6 +210,11 @@ pub fn main(args: &[String], argv: &[String]) -> Result<i32> {
                     let order = umi_tools_core::bundles::insertion_order(&bundle);
                     let umi_groups =
                         clusterer.cluster_ordered(&order, &counts, dedup_options.threshold)?;
+                    let gene = match (bundle_options.per_gene, bundle_options.per_contig) {
+                        (true, true) => None,
+                        (true, false) => Some(key.gene.as_deref().unwrap_or("NA")),
+                        (false, _) => Some("NA"),
+                    };
                     for umi_group in &umi_groups {
                         let Some(top_umi) = umi_group.first() else {
                             continue;
@@ -240,54 +225,72 @@ pub fn main(args: &[String], argv: &[String]) -> Result<i32> {
                             .sum();
 
                         for umi in umi_group {
-                            let Some(entry) = bundle.get(umi) else {
+                            let Some(entry) = bundle.get_mut(umi) else {
                                 continue;
                             };
-                            for read in entry.reads.all() {
-                                if let Some(w) = writer.as_mut() {
-                                    let mut tagged = read.clone();
-                                    tagged.data_mut().insert(
-                                        Tag::from(*b"UG"),
-                                        Value::Int32(i32::try_from(unique_id).unwrap_or(i32::MAX)),
-                                    );
-                                    tagged.data_mut().insert(
-                                        Tag::from(umi_group_tag),
-                                        Value::String(top_umi.clone().into()),
-                                    );
-                                    w.write(&tagged)?;
+                            let row = match mapping_out {
+                                Some(_) => Some(GroupRow {
+                                    gene,
+                                    umi: utilities::decode_utf8(umi)?,
+                                    umi_count: counts.get(umi).copied().unwrap_or(0),
+                                    final_umi: utilities::decode_utf8(top_umi)?,
+                                    final_umi_count: group_count,
+                                    unique_id,
+                                }),
+                                None => None,
+                            };
+                            let contig = |id: Option<usize>| {
+                                id.and_then(|id| reference_names.get(id))
+                                    .map_or("", String::as_str)
+                            };
+                            match std::mem::take(&mut entry.reads) {
+                                BundleReads::Many(reads) => {
+                                    for mut read in reads {
+                                        if let (Some(f), Some(row)) = (mapping_out.as_mut(), &row) {
+                                            let position = get_read_position(
+                                                &read,
+                                                bundle_options.soft_clip_threshold,
+                                            )?
+                                            .pos;
+                                            row.write(
+                                                f,
+                                                read.name().unwrap_or_default(),
+                                                contig(read.reference_id()),
+                                                position,
+                                            )?;
+                                        }
+                                        if let Some(w) = writer.as_mut() {
+                                            let tag_error = |e: std::io::Error| {
+                                                PortError::alignment(e.to_string())
+                                            };
+                                            read.set_tag(
+                                                *b"UG",
+                                                TagValue::Int(
+                                                    i64::try_from(unique_id).unwrap_or(i64::MAX),
+                                                ),
+                                            )
+                                            .map_err(tag_error)?;
+                                            read.set_tag(umi_group_tag, TagValue::String(top_umi))
+                                                .map_err(tag_error)?;
+                                            w.write(read)?;
+                                        }
+                                        n_output += 1;
+                                    }
                                 }
-
-                                if let Some(f) = mapping_out.as_mut() {
-                                    let gene = if bundle_options.per_gene {
-                                        key.gene.clone().unwrap_or_else(|| "NA".to_string())
-                                    } else {
-                                        "NA".to_string()
-                                    };
-                                    let position = get_read_position(
-                                        read,
-                                        bundle_options.soft_clip_threshold,
-                                    )?
-                                    .pos;
-                                    writeln!(
-                                        f,
-                                        "{}\t{}\t{position}\t{gene}\t{}\t{}\t{}\t{group_count}\t{unique_id}",
-                                        read.name()
-                                            .map(|n| String::from_utf8_lossy(n.as_ref()).into_owned())
-                                            .unwrap_or_default(),
-                                        read.reference_sequence_id()
-                                            .and_then(|id| header
-                                                .reference_sequences()
-                                                .get_index(id)
-                                                .map(|(n, _)| String::from_utf8_lossy(n.as_ref())
-                                                    .into_owned()))
-                                            .unwrap_or_default(),
-                                        utilities::decode_utf8(umi)?,
-                                        counts.get(umi).copied().unwrap_or(0),
-                                        utilities::decode_utf8(top_umi)?,
-                                    )
-                                    .map_err(common::io_error)?;
+                                BundleReads::Summaries(reads) => {
+                                    for read in reads {
+                                        if let (Some(f), Some(row)) = (mapping_out.as_mut(), &row) {
+                                            row.write(
+                                                f,
+                                                &read.name,
+                                                contig(read.reference_id),
+                                                read.position,
+                                            )?;
+                                        }
+                                        n_output += 1;
+                                    }
                                 }
-                                n_output += 1;
+                                BundleReads::One(_) | BundleReads::CountOnly => {}
                             }
                         }
                         unique_id += 1;
@@ -298,13 +301,20 @@ pub fn main(args: &[String], argv: &[String]) -> Result<i32> {
         Ok(())
     };
 
-    for record in umi_tools_core::alignment::fetch(&records, output_unmapped) {
-        let reference_name = opened.reference_name(record);
-        let items = bundler.push(record.clone(), reference_name.as_deref())?;
-        process(items, &mut clusterer, &mut writer, &mut mapping_out)?;
-    }
+    common::for_each_record(&mut opened, &input, |record| {
+        let reference_name = record
+            .reference_id()
+            .and_then(|id| reference_names.get(id))
+            .map(String::as_str);
+        process(
+            &mut bundler.push(record, reference_name)?,
+            &mut clusterer,
+            &mut writer,
+            &mut mapping_out,
+        )
+    })?;
     process(
-        bundler.finish(),
+        &mut bundler.finish(),
         &mut clusterer,
         &mut writer,
         &mut mapping_out,
@@ -312,19 +322,6 @@ pub fn main(args: &[String], argv: &[String]) -> Result<i32> {
 
     if let Some(w) = writer.take() {
         w.finish()?;
-        if let Some(names) = names.as_ref() {
-            if let (Some(sorted_name), Some(sorted_format)) =
-                (names.sorted_out_name.as_ref(), names.sorted_out_format)
-            {
-                umi_tools_core::alignment::sort_output_to(
-                    Path::new(&names.out_name),
-                    (!to_stdout).then(|| Path::new(sorted_name.as_str())),
-                    names.out_format,
-                    sorted_format,
-                    io.reference_filename.as_deref(),
-                )?;
-            }
-        }
     }
     if let Some(f) = mapping_out.take() {
         f.finish()?;
@@ -342,6 +339,38 @@ pub fn main(args: &[String], argv: &[String]) -> Result<i32> {
 
     options::stop(&io, &run_id, started.elapsed().as_secs())?;
     Ok(0)
+}
+
+struct GroupRow<'a> {
+    gene: Option<&'a str>,
+    umi: String,
+    umi_count: u64,
+    final_umi: String,
+    final_umi_count: u64,
+    unique_id: u64,
+}
+
+impl GroupRow<'_> {
+    fn write(
+        &self,
+        out: &mut utilities::OutputFile,
+        name: &[u8],
+        contig: &str,
+        position: i64,
+    ) -> Result<()> {
+        writeln!(
+            out,
+            "{}\t{contig}\t{position}\t{}\t{}\t{}\t{}\t{}\t{}",
+            String::from_utf8_lossy(name),
+            self.gene.unwrap_or(contig),
+            self.umi,
+            self.umi_count,
+            self.final_umi,
+            self.final_umi_count,
+            self.unique_id,
+        )
+        .map_err(common::io_error)
+    }
 }
 
 #[cfg(test)]

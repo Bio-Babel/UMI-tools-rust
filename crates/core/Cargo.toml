@@ -19,6 +19,7 @@ thiserror.workspace = true
 regex.workspace = true
 flate2.workspace = true
 itertools.workspace = true
+indexmap.workspace = true
 rand.workspace = true
 tempfile.workspace = true
 uuid.workspace = true
@@ -27,6 +28,7 @@ noodles-sam.workspace = true
 noodles-bam.workspace = true
 noodles-cram.workspace = true
 noodles-bgzf.workspace = true
+noodles-csi.workspace = true
 noodles-fasta.workspace = true
 
 [dev-dependencies]

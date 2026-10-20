@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use noodles_sam::alignment::record::cigar::op::Kind;
-use noodles_sam::alignment::RecordBuf;
+use umi_tools_core::BamRecord;
 
 use umi_tools_core::alignment::{open_input_alignments, OpenedAlignment};
 use umi_tools_core::bundles::{BundleFlags, BundleItem, GetBundles};
@@ -97,11 +97,11 @@ fn read_positions_match_python_on_real_bams() {
 
     for (name, cases) in doc["read_positions"].as_object().unwrap() {
         let mut opened = open(name);
-        let records: Vec<RecordBuf> = opened.read_all().unwrap();
+        let records: Vec<BamRecord> = opened.records(true).collect::<Result<_, _>>().unwrap();
         let cases = cases.as_array().unwrap();
 
         // The fixture skipped unmapped reads and stopped at 400 records.
-        let mapped: Vec<&RecordBuf> = records
+        let mapped: Vec<&BamRecord> = records
             .iter()
             .filter(|r| !r.flags().is_unmapped())
             .collect();
@@ -211,7 +211,8 @@ fn bundles_match_python_on_real_bams() {
 
     for (label, bam, options, flags) in scenarios {
         let mut opened = open(bam);
-        let all_records = opened.read_all().unwrap();
+        let reference_names = opened.reference_names();
+        let all_records: Vec<BamRecord> = opened.records(true).collect::<Result<_, _>>().unwrap();
 
         // The exporter processed only the first N records; the Rust side must
         // consume exactly the same ones, so the count and both endpoints are
@@ -224,7 +225,7 @@ fn bundles_match_python_on_real_bams() {
         );
         let records = &all_records[..limit];
 
-        let name_of = |r: &RecordBuf| String::from_utf8_lossy(r.name().unwrap()).into_owned();
+        let name_of = |r: &BamRecord| String::from_utf8_lossy(r.name().unwrap()).into_owned();
         assert_eq!(
             name_of(&records[0]),
             doc[label]["first_qname"].as_str().unwrap(),
@@ -246,7 +247,8 @@ fn bundles_match_python_on_real_bams() {
         );
 
         let mut produced: Vec<Vec<(String, u64)>> = Vec::new();
-        let collect = |items: Vec<BundleItem>, out: &mut Vec<Vec<(String, u64)>>| {
+        let collect = |items: &mut dyn Iterator<Item = BundleItem>,
+                       out: &mut Vec<Vec<(String, u64)>>| {
             for item in items {
                 if let BundleItem::Bundle { bundle, .. } = item {
                     let mut umis: Vec<(String, u64)> = bundle
@@ -262,13 +264,16 @@ fn bundles_match_python_on_real_bams() {
         };
 
         for record in records {
-            let reference_name = opened.reference_name(record);
-            let items = bundler
-                .push(record.clone(), reference_name.as_deref())
+            let reference_name = record
+                .reference_id()
+                .and_then(|id| reference_names.get(id))
+                .map(String::as_str);
+            let mut items = bundler
+                .push(record.clone(), reference_name)
                 .unwrap_or_else(|e| panic!("{label}: {e}"));
-            collect(items, &mut produced);
+            collect(&mut items, &mut produced);
         }
-        collect(bundler.finish(), &mut produced);
+        collect(&mut bundler.finish(), &mut produced);
 
         let mut expected: Vec<Vec<(String, u64)>> = doc[label]["bundles"]
             .as_array()

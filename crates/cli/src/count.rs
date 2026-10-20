@@ -8,8 +8,10 @@
 //! mapping coordinate is no longer informative — which is why `--per-gene` is
 //! hard-coded on, as the Python docstring notes.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::io::{BufWriter, Write};
+use std::collections::BTreeMap;
+use std::io::Write;
+
+use indexmap::IndexSet;
 
 use umi_tools_core::bundles::{BundleFlags, BundleItem};
 use umi_tools_core::network::UmiClusterer;
@@ -87,7 +89,7 @@ pub fn main(args: &[String], argv: &[String]) -> Result<i32> {
     let per_cell = bundle_options.per_cell;
 
     let mut opened = common::open_input(&io)?;
-    let records = opened.read_all()?;
+    let reference_names = common::reference_names(&opened.header);
     let mut bundler = common::build_bundler(
         &matches,
         &bundle_options,
@@ -97,21 +99,32 @@ pub fn main(args: &[String], argv: &[String]) -> Result<i32> {
         },
     )?;
 
+    let input = common::input(
+        &io,
+        validation.gene_transcript_map.as_deref(),
+        &opened.header,
+        false,
+    )?;
+    if let common::Input::Meta(map) = &input {
+        bundler.with_metacontigs(map.clone());
+    }
+
     let mut clusterer = UmiClusterer::new(dedup_options.method);
-    // gene -> cell -> count. `None` is the no-cell-barcode case.
-    let mut gene_counts: BTreeMap<String, BTreeMap<Option<String>, usize>> = BTreeMap::new();
-    let mut cells: BTreeSet<Option<String>> = BTreeSet::new();
+    let mut out = common::open_text_output(io.stdout.as_deref())?;
+    // Without --per-cell Python writes a row per bundle, in bundle order.
+    if !per_cell {
+        writeln!(out, "gene\tcount").map_err(common::io_error)?;
+    }
+    // With --per-cell it keeps the last count per (gene, cell), sorted at the end.
+    let mut cells: IndexSet<String> = IndexSet::new();
+    let mut gene_counts: BTreeMap<String, Vec<(u32, usize)>> = BTreeMap::new();
     let mut n_input = 0u64;
     let mut n_output = 0u64;
     let mut reported = 0u64;
 
-    let handle = |items: Vec<BundleItem>,
-                  clusterer: &mut UmiClusterer,
-                  gene_counts: &mut BTreeMap<String, BTreeMap<Option<String>, usize>>,
-                  cells: &mut BTreeSet<Option<String>>,
-                  n_input: &mut u64,
-                  n_output: &mut u64,
-                  reported: &mut u64|
+    let mut handle = |items: &mut dyn Iterator<Item = BundleItem>,
+                      clusterer: &mut UmiClusterer,
+                      out: &mut common::TextOutput|
      -> Result<()> {
         for item in items {
             let BundleItem::Bundle { bundle, key } = item else {
@@ -121,86 +134,100 @@ pub fn main(args: &[String], argv: &[String]) -> Result<i32> {
                 .iter()
                 .map(|(umi, entry)| (umi.clone(), entry.count))
                 .collect();
-            *n_input += counts.values().sum::<u64>();
-            while *n_input >= *reported + 1_000_000 {
-                *reported += 1_000_000;
+            n_input += counts.values().sum::<u64>();
+            while n_input >= reported + 1_000_000 {
+                reported += 1_000_000;
                 utilities::info(&format!("Parsed {reported} input reads"));
             }
 
             let order = umi_tools_core::bundles::insertion_order(&bundle);
             let groups = clusterer.cluster_ordered(&order, &counts, dedup_options.threshold)?;
-            let gene = key.gene.clone().unwrap_or_default();
-            let cell = key
-                .cell
-                .as_ref()
-                .map(|c| utilities::decode_utf8(c))
-                .transpose()?;
-            cells.insert(cell.clone());
-            *gene_counts
+            let gene = key.gene.unwrap_or_default();
+            n_output += groups.len() as u64;
+            if !per_cell {
+                writeln!(out, "{gene}\t{}", groups.len()).map_err(common::io_error)?;
+                continue;
+            }
+            let cell = match &key.cell {
+                Some(c) => utilities::decode_utf8(c)?,
+                None => String::new(),
+            };
+            let (cell, _) = cells.insert_full(cell);
+            let cell = u32::try_from(cell)
+                .map_err(|_| umi_tools_core::PortError::value("too many cell barcodes"))?;
+            gene_counts
                 .entry(gene)
                 .or_default()
-                .entry(cell)
-                .or_insert(0) += groups.len();
-            *n_output += groups.len() as u64;
+                .push((cell, groups.len()));
         }
         Ok(())
     };
 
-    for record in umi_tools_core::alignment::fetch(&records, false) {
-        let reference_name = opened.reference_name(record);
-        let items = bundler.push(record.clone(), reference_name.as_deref())?;
+    common::for_each_record(&mut opened, &input, |record| {
+        let reference_name = record
+            .reference_id()
+            .and_then(|id| reference_names.get(id))
+            .map(String::as_str);
         handle(
-            items,
+            &mut bundler.push(record, reference_name)?,
             &mut clusterer,
-            &mut gene_counts,
-            &mut cells,
-            &mut n_input,
-            &mut n_output,
-            &mut reported,
-        )?;
-    }
-    handle(
-        bundler.finish(),
-        &mut clusterer,
-        &mut gene_counts,
-        &mut cells,
-        &mut n_input,
-        &mut n_output,
-        &mut reported,
-    )?;
+            &mut out,
+        )
+    })?;
+    handle(&mut bundler.finish(), &mut clusterer, &mut out)?;
 
-    let mut out = BufWriter::new(std::io::stdout());
     if per_cell {
-        let cell_names: Vec<String> = cells
-            .iter()
-            .map(|c| c.clone().unwrap_or_default())
-            .collect();
+        let mut sorted_cells: Vec<u32> = (0..cells.len() as u32).collect();
+        sorted_cells.sort_by(|&a, &b| cells[a as usize].cmp(&cells[b as usize]));
+        let mut rank = vec![0u32; cells.len()];
+        for (i, &cell) in sorted_cells.iter().enumerate() {
+            rank[cell as usize] = i as u32;
+        }
+        // A cell seen twice keeps its last count, as Python's dict assignment does.
+        let by_cell = |entries: &mut Vec<(u32, usize)>| {
+            entries.sort_by_key(|&(cell, _)| rank[cell as usize]);
+            entries.dedup_by(|later, kept| {
+                let same = later.0 == kept.0;
+                if same {
+                    kept.1 = later.1;
+                }
+                same
+            });
+        };
         if matches.get_flag("wide_format_cell_counts") {
-            writeln!(out, "gene\t{}", cell_names.join("\t")).map_err(common::io_error)?;
-            for (gene, by_cell) in &gene_counts {
-                let row: Vec<String> = cells
-                    .iter()
-                    .map(|c| by_cell.get(c).copied().unwrap_or(0).to_string())
-                    .collect();
-                writeln!(out, "{gene}\t{}", row.join("\t")).map_err(common::io_error)?;
+            let names: Vec<&str> = sorted_cells
+                .iter()
+                .map(|&c| cells[c as usize].as_str())
+                .collect();
+            writeln!(out, "gene\t{}", names.join("\t")).map_err(common::io_error)?;
+            for (gene, entries) in &mut gene_counts {
+                by_cell(entries);
+                write!(out, "{gene}").map_err(common::io_error)?;
+                let mut entries = entries.iter().peekable();
+                for &cell in &sorted_cells {
+                    let count = match entries.peek() {
+                        Some(&&(c, n)) if c == cell => {
+                            entries.next();
+                            n
+                        }
+                        _ => 0,
+                    };
+                    write!(out, "\t{count}").map_err(common::io_error)?;
+                }
+                writeln!(out).map_err(common::io_error)?;
             }
         } else {
             writeln!(out, "gene\tcell\tcount").map_err(common::io_error)?;
-            for (gene, by_cell) in &gene_counts {
-                for (cell, count) in by_cell {
-                    writeln!(out, "{gene}\t{}\t{count}", cell.clone().unwrap_or_default())
+            for (gene, entries) in &mut gene_counts {
+                by_cell(entries);
+                for &(cell, count) in entries.iter() {
+                    writeln!(out, "{gene}\t{}\t{count}", cells[cell as usize])
                         .map_err(common::io_error)?;
                 }
             }
         }
-    } else {
-        writeln!(out, "gene\tcount").map_err(common::io_error)?;
-        for (gene, by_cell) in &gene_counts {
-            let total: usize = by_cell.values().sum();
-            writeln!(out, "{gene}\t{total}").map_err(common::io_error)?;
-        }
     }
-    out.flush().map_err(common::io_error)?;
+    out.finish()?;
 
     for (event, count) in bundler.read_events() {
         utilities::info(&format!("{event}: {count}"));
@@ -221,6 +248,60 @@ mod tests {
     #[test]
     fn about_names_the_command() {
         assert!(ABOUT.starts_with("count - "));
+    }
+
+    #[test]
+    fn counts_follow_pythons_rows_and_go_to_the_output_file() {
+        use std::fmt::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let sam = dir.path().join("in.sam");
+        let mut text =
+            String::from("@HD\tVN:1.6\tSO:coordinate\n@SQ\tSN:c1\tLN:1000\n@SQ\tSN:c2\tLN:1000\n");
+        // c1: G1 has UMIs AAAA and CCCC in cell X; c2: G1 has GGGG in X; G0 on c2.
+        for (i, (contig, pos, umi, gene)) in [
+            ("c1", 10, "AAAA", "G1"),
+            ("c1", 20, "CCCC", "G1"),
+            ("c2", 10, "GGGG", "G1"),
+            ("c2", 30, "TTTT", "G0"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            writeln!(
+                text,
+                "r{i}\t0\t{contig}\t{pos}\t30\t4M\t*\t0\t0\tACGT\tIIII\tUB:Z:{umi}\tCB:Z:X\tGX:Z:{gene}"
+            )
+            .unwrap();
+        }
+        std::fs::write(&sam, text).unwrap();
+
+        let run = |extra: &[&str]| -> String {
+            let out = dir.path().join("counts.tsv");
+            let mut args: Vec<String> = [
+                "-I",
+                sam.to_str().unwrap(),
+                "--in-sam",
+                "-S",
+                out.to_str().unwrap(),
+                "--extract-umi-method=tag",
+                "--umi-tag=UB",
+                "--cell-tag=CB",
+                "--gene-tag=GX",
+                "--log",
+                dir.path().join("log").to_str().unwrap(),
+            ]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+            args.extend(extra.iter().map(|s| (*s).to_string()));
+            assert_eq!(main(&args, &["count".to_string()]).unwrap(), 0);
+            std::fs::read_to_string(out).unwrap()
+        };
+        assert_eq!(
+            run(&["--per-cell"]),
+            "gene\tcell\tcount\nG0\tX\t1\nG1\tX\t1\n"
+        );
+        assert_eq!(run(&[]), "gene\tcount\nG1\t2\nG0\t1\nG1\t1\n");
     }
 
     #[test]

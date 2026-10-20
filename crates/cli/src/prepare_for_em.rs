@@ -208,12 +208,17 @@ pub fn main(args: &[String], argv: &[String]) -> Result<i32> {
         .map_or_else(|| "-".to_string(), |p| p.to_string_lossy().into_owned());
     let out_format = determine_format(&out_name, io.out_sam, io.out_format);
     let mut writer = match io.stdout.as_deref() {
-        Some(path) => {
-            open_output_alignments(path, out_format, &header, io.reference_filename.as_deref())?
-        }
+        Some(path) => open_output_alignments(
+            path,
+            out_format,
+            &header,
+            opened.header_text(),
+            io.reference_filename.as_deref(),
+        )?,
         None => umi_tools_core::alignment::open_output_alignments_to_stdout(
             out_format,
             &header,
+            opened.header_text(),
             io.reference_filename.as_deref(),
         )?,
     };

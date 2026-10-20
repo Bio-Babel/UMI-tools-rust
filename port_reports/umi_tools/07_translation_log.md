@@ -120,21 +120,28 @@ Both are implemented and verified against the live interpreters.
 
 ### `pysam` → `noodles`
 
-| `pysam` | `noodles` | Note |
+`dedup`, `group` and `count` hold reads as `record::BamRecord` — the record's
+BAM encoding, which is also what a `pysam.AlignedSegment` wraps — and read
+fields through `noodles_bam::RecordRef`. Other commands use `noodles`'
+decoded `RecordBuf`.
+
+| `pysam` | Rust | Note |
 |---|---|---|
-| `read.qname` | `record.name()` | returns `Option<&BStr>` |
-| `read.pos` | `record.alignment_start()` | **1-based** in noodles, 0-based in pysam; every use subtracts 1 |
-| `read.aend` | `record.alignment_end()` | 1-based; the half-open end matches pysam's value directly |
-| `read.mapq` | `raw_mapping_quality(record)` | see defect 3 above |
-| `read.cigar` | `record.cigar()` | `(Kind, usize)` pairs rather than `(int, int)` |
+| `read.qname` | `record.name()` | `None` for `*` |
+| `read.pos` | `record.position()` | 0-based, as pysam |
+| `read.aend` | `pos` + the CIGAR's reference span | computed in `sam::get_read_position` |
+| `read.mapq` | `record.mapping_quality()` | the raw byte, 255 included; see defect 3 above |
+| `read.cigar` | `record.view().cigar()` | `(Kind, usize)` pairs rather than `(int, int)` |
 | `read.tlen` | `record.template_length()` | |
 | `read.is_reverse` | `record.flags().is_reverse_complemented()` | |
 | `read.is_read2` | `flags.is_segmented() && flags.is_last_segment()` | pysam's `is_read2` implies paired |
 | `read.get_tag(t)` / `read.opt(t)` | `sam::tag_text(record, t)` | coerces any scalar type to text, as pysam does |
-| `read.set_tag(t, v)` | `record.data_mut().insert(...)` | |
+| `read.set_tag(t, v)` | `record.set_tag(t, v)` | moves an existing tag to the end and picks the smallest integer type, as pysam does |
 | `AlignmentFile.references` | `header.reference_sequences().keys()` | |
-| `AlignmentFile.fetch()` | `alignment::fetch(records, until_eof)` | `fetch()` skips the unplaced block; `fetch(until_eof=True)` does not |
-| `pysam.sort(...)` | `alignment::sort_output_to` | in-memory rather than spilling to disk; see `08_validation.md` |
+| `AlignmentFile.fetch()` | `OpenedAlignment::records(until_eof)` | streamed; `fetch()` skips the unplaced block, `fetch(until_eof=True)` does not |
+| `AlignmentFile.fetch(reference=c)` | `OpenedAlignment::fetch_reference(id)` | seeks with a `.bai`/`.csi` index; without one reads forward, where pysam refuses |
+| `AlignmentFile(..., template=infile)` | `open_output_alignments(.., header_text, ..)` | SAM and BAM headers are the input's text, as htslib carries it over |
+| `pysam.sort(...)` | `alignment::CoordinateSorter` | samtools' order and memory budget, spilling sorted runs to temporary files |
 
 ### `optparse` → `clap`
 

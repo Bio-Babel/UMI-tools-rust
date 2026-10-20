@@ -6,16 +6,17 @@
 //! shortened read back out. Everything downstream — the aligner, then `dedup`
 //! or `count` — carries the barcode in the read name from here on.
 
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use std::path::Path;
 
 use umi_tools_core::extract::{ExtractConfig, ExtractFilterAndUpdate, ExtractMethod};
 use umi_tools_core::options::validate_extract_options;
 use umi_tools_core::umi_methods::{FastqIterator, JoinedFastqIterator, Record};
-use umi_tools_core::utilities::{self, InputFile, OutputFile};
+use umi_tools_core::utilities::{self, InputFile};
 use umi_tools_core::whitelist::{get_user_defined_barcodes, ErrorCorrectionMode};
 use umi_tools_core::{PortError, Result};
 
+use crate::common;
 use crate::documentation;
 use crate::options::{self, OptionGroups};
 
@@ -293,7 +294,7 @@ pub fn main(args: &[String], argv: &[String]) -> Result<i32> {
         .transpose()
         .map_err(|e| PortError::value(format!("--subset-reads: {e}")))?;
 
-    let mut out = open_output(io.stdout.as_deref())?;
+    let mut out = common::open_text_output(io.stdout.as_deref())?;
     let mut filtered_out = extract_opts
         .filtered_out
         .as_deref()
@@ -416,44 +417,6 @@ pub fn main(args: &[String], argv: &[String]) -> Result<i32> {
 
     options::stop(&io, &run_id, started.elapsed().as_secs())?;
     Ok(0)
-}
-
-/// A destination for extracted reads: a file, or standard output.
-enum Output {
-    File(Box<OutputFile>),
-    Stdout(BufWriter<std::io::Stdout>),
-}
-
-impl Write for Output {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        match self {
-            Output::File(f) => f.write(buf),
-            Output::Stdout(w) => w.write(buf),
-        }
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        match self {
-            Output::File(f) => f.flush(),
-            Output::Stdout(w) => w.flush(),
-        }
-    }
-}
-
-impl Output {
-    fn finish(self) -> Result<()> {
-        match self {
-            Output::File(f) => f.finish(),
-            Output::Stdout(mut w) => w.flush().map_err(io_error),
-        }
-    }
-}
-
-fn open_output(path: Option<&Path>) -> Result<Output> {
-    match path {
-        Some(p) => Ok(Output::File(Box::new(utilities::create_file(p, false)?))),
-        None => Ok(Output::Stdout(BufWriter::new(std::io::stdout()))),
-    }
 }
 
 fn io_error(e: std::io::Error) -> PortError {

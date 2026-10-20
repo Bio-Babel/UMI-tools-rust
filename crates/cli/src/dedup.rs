@@ -10,13 +10,14 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use umi_tools_core::alignment::open_output_alignments;
-use umi_tools_core::bundles::{BundleFlags, BundleItem};
+use umi_tools_core::alignment::{AlignmentSink, BamRecord};
+use umi_tools_core::bundles::{BundleFlags, BundleItem, BundleReads};
 use umi_tools_core::network::{ClusterMethod, ReadDeduplicator};
 use umi_tools_core::options::validate_sam_options;
+use umi_tools_core::sam::TwoPassPairWriter;
 use umi_tools_core::stats;
 use umi_tools_core::umi_methods::{get_average_umi_distance, RandomReadGenerator};
-use umi_tools_core::utilities::{self, output_names_and_formats};
+use umi_tools_core::utilities;
 use umi_tools_core::whitelist::{get_user_defined_barcodes, ErrorCorrectionMode};
 use umi_tools_core::{PortError, Result};
 
@@ -40,33 +41,34 @@ pub const MULTIMAPPING_TAGS: [&str; 3] = ["NH", "X0", "XT"];
 ///
 /// Python examines `n_entries + 1` records, because its loop breaks on
 /// `n > n_entries` after having already processed record `n`; that off-by-one
-/// is reproduced.
-#[must_use]
+/// is reproduced. `records` is a fresh `fetch(until_eof=True)` of the input.
 pub fn detect_bam_features(
-    records: &[noodles_sam::alignment::RecordBuf],
+    records: impl IntoIterator<Item = Result<BamRecord>>,
     n_entries: usize,
-) -> BTreeMap<String, bool> {
+) -> Result<BTreeMap<String, bool>> {
     let mut available: BTreeMap<String, bool> = MULTIMAPPING_TAGS
         .iter()
         .map(|t| ((*t).to_string(), true))
         .collect();
 
-    for (n, record) in records.iter().enumerate() {
+    for (n, record) in records.into_iter().enumerate() {
         if n > n_entries {
             break;
         }
+        let record = record?;
         if record.flags().is_unmapped() {
             continue;
         }
+        let view = record.view();
+        let data = view.data();
         for tag in MULTIMAPPING_TAGS {
             let bytes = tag.as_bytes();
-            let key = [bytes[0], bytes[1]];
-            if umi_tools_core::sam::tag_text(record, key).is_none() {
+            if data.get(&[bytes[0], bytes[1]]).is_none() {
                 available.insert(tag.to_string(), false);
             }
         }
     }
-    available
+    Ok(available)
 }
 
 /// Runs `umi_tools dedup` (Python source: `dedup.main`).
@@ -133,12 +135,13 @@ pub fn main(args: &[String], argv: &[String]) -> Result<i32> {
         ));
     }
 
-    let mut opened = common::open_input(&io)?;
-    let records = opened.read_all()?;
+    let source = common::input_source(&io)?;
+    let mut opened = source.open()?;
     let header = opened.header.clone();
+    let reference_names = common::reference_names(&header);
 
     if let Some(method) = bundle_options.detection_method {
-        let features = detect_bam_features(&records, 1000);
+        let features = detect_bam_features(source.open()?.records(true), 1000)?;
         let wanted = match method {
             umi_tools_core::options::DetectionMethod::Nh => "NH",
             umi_tools_core::options::DetectionMethod::X0 => "X0",
@@ -165,58 +168,12 @@ pub fn main(args: &[String], argv: &[String]) -> Result<i32> {
         }
     }
 
-    // Python names the eventual output "-" when it is standard output, and
-    // still sorts: `output_names_and_formats` routes the records through a
-    // temporary file whenever `--no-sort-output` is absent, then sorts that
-    // file to the pipe. Skipping the sort there yields the right reads in the
-    // wrong order, which the package's md5-comparing test suite rejects.
-    let to_stdout = io.stdout.is_none();
-    let eventual = io
-        .stdout
-        .as_ref()
-        .map_or_else(|| "-".to_string(), |p| p.to_string_lossy().into_owned());
-    let names = output_names_and_formats(
-        &eventual,
-        io.out_sam,
-        io.out_format,
-        io.no_sort_output,
-        io.tmpdir.as_deref(),
-    )?;
-
-    // With sorting on, `out_name` is a temporary file whichever way the
-    // eventual output goes; only the unsorted, straight-to-stdout case writes
-    // to the pipe directly.
-    let unsorted_to_stdout = to_stdout && names.sorted_out_name.is_none();
-    let raw_writer = if unsorted_to_stdout {
-        umi_tools_core::alignment::open_output_alignments_to_stdout(
-            names.out_format,
-            &header,
-            io.reference_filename.as_deref(),
-        )?
-    } else {
-        open_output_alignments(
-            Path::new(&names.out_name),
-            names.out_format,
-            &header,
-            io.reference_filename.as_deref(),
-        )?
-    };
-
-    // With `--paired`, each retained read 1 must be accompanied by its read 2,
-    // which `TwoPassPairWriter` finds in a second pass over the same records.
-    let reference_names: Vec<String> = header
-        .reference_sequences()
-        .keys()
-        .map(|k| String::from_utf8_lossy(k.as_ref()).into_owned())
-        .collect();
+    // Sorted unless `--no-sort-output`, even to a pipe, as in Python.
+    let sink = common::open_output(&io, &opened)?;
     let mut writer = if bundle_options.paired {
-        Writer::Paired(Box::new(umi_tools_core::sam::TwoPassPairWriter::new(
-            &records,
-            reference_names,
-            raw_writer,
-        )))
+        Writer::Paired(Box::new(TwoPassPairWriter::new(source.clone(), sink)))
     } else {
-        Writer::Single(Box::new(raw_writer))
+        Writer::Single(Box::new(sink))
     };
 
     let mut deduplicator = if dedup_options.filter_umi {
@@ -236,10 +193,17 @@ pub fn main(args: &[String], argv: &[String]) -> Result<i32> {
 
     let mut bundler = common::build_bundler(&matches, &bundle_options, BundleFlags::default())?;
     let getter = common::barcode_getter(&matches, bundle_options.per_cell)?;
+    let input = common::input(
+        &io,
+        validation.gene_transcript_map.as_deref(),
+        &header,
+        false,
+    )?;
+    if let common::Input::Meta(map) = &input {
+        bundler.with_metacontigs(map.clone());
+    }
 
-    // The null distribution for --output-stats needs UMI frequencies over the
-    // whole file. Python makes a second pass over the BAM for this; the
-    // records are already in memory here, so one scan suffices.
+    // Python's `random_read_generator`: its own pass over the input.
     let mut random_reads = if stats_prefix.is_none() {
         None
     } else {
@@ -247,31 +211,24 @@ pub fn main(args: &[String], argv: &[String]) -> Result<i32> {
         // `defaultdict(int)`, so the table is in first-seen order — and
         // `numpy.random.choice` indexes into that order, so it has to be
         // preserved rather than sorted.
-        let mut order: Vec<Vec<u8>> = Vec::new();
-        let mut frequencies: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
-        for record in umi_tools_core::alignment::fetch(&records, false) {
+        let mut frequencies: indexmap::IndexMap<Vec<u8>, u64> = indexmap::IndexMap::new();
+        let whole = match &input {
+            common::Input::Chrom(id) => common::Input::Chrom(*id),
+            _ => common::Input::Fetch { until_eof: false },
+        };
+        common::for_each_record(&mut source.open()?, &whole, |record| {
             let flags = record.flags();
             // Python skips unmapped reads and read 2s, and swallows a
             // missing tag rather than failing.
             if flags.is_unmapped() || (flags.is_segmented() && flags.is_last_segment()) {
-                continue;
+                return Ok(());
             }
-            if let Ok(barcode) = getter.get(record) {
-                if let Some(count) = frequencies.get_mut(&barcode.umi) {
-                    *count += 1;
-                } else {
-                    order.push(barcode.umi.clone());
-                    frequencies.insert(barcode.umi, 1);
-                }
+            if let Ok(barcode) = getter.get(&record) {
+                *frequencies.entry(barcode.umi).or_insert(0) += 1;
             }
-        }
-        let table: Vec<(Vec<u8>, u64)> = order
-            .into_iter()
-            .map(|umi| {
-                let count = frequencies.get(&umi).copied().unwrap_or(0);
-                (umi, count)
-            })
-            .collect();
+            Ok(())
+        })?;
+        let table: Vec<(Vec<u8>, u64)> = frequencies.into_iter().collect();
         Some(RandomReadGenerator::new(
             &table,
             u32::try_from(bundle_options.random_seed.unwrap_or(0) & 0xffff_ffff).unwrap_or(0),
@@ -290,12 +247,12 @@ pub fn main(args: &[String], argv: &[String]) -> Result<i32> {
     let mut pre_null: Vec<f64> = Vec::new();
     let mut post_null: Vec<f64> = Vec::new();
 
-    let mut process = |items: Vec<BundleItem>,
-                       writer: &mut Writer<'_>,
+    let mut process = |items: &mut dyn Iterator<Item = BundleItem>,
+                       writer: &mut Writer,
                        deduplicator: &mut ReadDeduplicator|
      -> Result<()> {
         for item in items {
-            let BundleItem::Bundle { bundle, .. } = item else {
+            let BundleItem::Bundle { mut bundle, .. } = item else {
                 continue;
             };
             let counts: umi_tools_core::network::CountMap = bundle
@@ -313,8 +270,8 @@ pub fn main(args: &[String], argv: &[String]) -> Result<i32> {
             }
 
             if bundle_options.ignore_umi {
-                for entry in bundle.values() {
-                    if let Some(read) = entry.reads.one() {
+                for (_, entry) in bundle {
+                    if let BundleReads::One(read) = entry.reads {
                         writer.write(read)?;
                         n_output += 1;
                     }
@@ -330,16 +287,16 @@ pub fn main(args: &[String], argv: &[String]) -> Result<i32> {
                 continue;
             }
             for umi in &result.final_umis {
-                if let Some(read) = bundle.get(umi).and_then(|e| e.reads.one()) {
+                let reads = bundle.get_mut(umi).map(|e| std::mem::take(&mut e.reads));
+                if let Some(BundleReads::One(read)) = reads {
                     writer.write(read)?;
                     n_output += 1;
                 }
             }
 
             if let Some(generator) = random_reads.as_mut() {
-                let bundle_umis: Vec<Vec<u8>> = bundle.keys().cloned().collect();
-                pre_cluster.push(get_average_umi_distance(&bundle_umis));
-                let random = generator.get_umis(bundle_umis.len());
+                pre_cluster.push(get_average_umi_distance(&order));
+                let random = generator.get_umis(order.len());
                 pre_null.push(get_average_umi_distance(&random));
                 for (umi, entry) in &bundle {
                     stats_pre.push((umi.clone(), entry.count));
@@ -356,26 +313,19 @@ pub fn main(args: &[String], argv: &[String]) -> Result<i32> {
         Ok(())
     };
 
-    // `dedup` always uses plain `fetch()`, which skips the unplaced block.
-    for record in umi_tools_core::alignment::fetch(&records, false) {
-        let reference_name = opened.reference_name(record);
-        let items = bundler.push(record.clone(), reference_name.as_deref())?;
-        process(items, &mut writer, &mut deduplicator)?;
-    }
-    process(bundler.finish(), &mut writer, &mut deduplicator)?;
+    common::for_each_record(&mut opened, &input, |record| {
+        let reference_name = record
+            .reference_id()
+            .and_then(|id| reference_names.get(id))
+            .map(String::as_str);
+        process(
+            &mut bundler.push(record, reference_name)?,
+            &mut writer,
+            &mut deduplicator,
+        )
+    })?;
+    process(&mut bundler.finish(), &mut writer, &mut deduplicator)?;
     writer.finish()?;
-
-    if let (Some(sorted_name), Some(sorted_format)) =
-        (names.sorted_out_name.as_ref(), names.sorted_out_format)
-    {
-        umi_tools_core::alignment::sort_output_to(
-            Path::new(&names.out_name),
-            (!to_stdout).then(|| Path::new(sorted_name.as_str())),
-            names.out_format,
-            sorted_format,
-            io.reference_filename.as_deref(),
-        )?;
-    }
 
     if let Some(prefix) = stats_prefix {
         write_stats(
@@ -418,18 +368,17 @@ pub fn main(args: &[String], argv: &[String]) -> Result<i32> {
 
 /// Where deduplicated reads go.
 ///
-/// `--paired` routes them through [`umi_tools_core::sam::TwoPassPairWriter`],
-/// which also emits each retained read's mate; everything else writes
-/// directly. Python makes the same choice by rebinding `outfile`.
-enum Writer<'a> {
+/// `--paired` routes them through [`TwoPassPairWriter`], which also emits
+/// each retained read's mate.
+enum Writer {
     /// Single-end: write the record and nothing else.
-    Single(Box<umi_tools_core::alignment::OpenedAlignmentWriter>),
+    Single(Box<AlignmentSink>),
     /// Paired-end: also owe, and later emit, each read's mate.
-    Paired(Box<umi_tools_core::sam::TwoPassPairWriter<'a>>),
+    Paired(Box<TwoPassPairWriter>),
 }
 
-impl Writer<'_> {
-    fn write(&mut self, record: &noodles_sam::alignment::RecordBuf) -> Result<()> {
+impl Writer {
+    fn write(&mut self, record: BamRecord) -> Result<()> {
         match self {
             Writer::Single(w) => w.write(record),
             Writer::Paired(w) => w.write(record, false),
@@ -486,7 +435,7 @@ mod tests {
     use noodles_sam::alignment::record_buf::data::field::Value;
     use noodles_sam::alignment::RecordBuf;
 
-    fn record(tags: &[(&[u8; 2], i32)], unmapped: bool) -> RecordBuf {
+    fn bam(tags: &[(&[u8; 2], i32)], unmapped: bool) -> BamRecord {
         let mut r = RecordBuf::default();
         *r.flags_mut() = if unmapped {
             Flags::UNMAPPED
@@ -496,7 +445,7 @@ mod tests {
         for (tag, value) in tags {
             r.data_mut().insert(Tag::from(**tag), Value::Int32(*value));
         }
-        r
+        BamRecord::from_alignment_record(&noodles_sam::Header::default(), &r).unwrap()
     }
 
     #[test]
@@ -506,30 +455,34 @@ mod tests {
 
     #[test]
     fn feature_detection_requires_every_read_to_carry_the_tag() {
-        let records = vec![record(&[(b"NH", 1)], false), record(&[(b"NH", 1)], false)];
-        let features = detect_bam_features(&records, 1000);
+        let records = vec![Ok(bam(&[(b"NH", 1)], false)), Ok(bam(&[(b"NH", 1)], false))];
+        let features = detect_bam_features(records, 1000).unwrap();
         assert!(features["NH"]);
         assert!(!features["X0"]);
         assert!(!features["XT"]);
 
         // One read without NH is enough to make it unavailable.
-        let records = vec![record(&[(b"NH", 1)], false), record(&[], false)];
-        assert!(!detect_bam_features(&records, 1000)["NH"]);
+        let records = vec![Ok(bam(&[(b"NH", 1)], false)), Ok(bam(&[], false))];
+        assert!(!detect_bam_features(records, 1000).unwrap()["NH"]);
     }
 
     #[test]
     fn feature_detection_skips_unmapped_reads() {
-        let records = vec![record(&[(b"NH", 1)], false), record(&[], true)];
-        assert!(detect_bam_features(&records, 1000)["NH"]);
+        let records = vec![Ok(bam(&[(b"NH", 1)], false)), Ok(bam(&[], true))];
+        assert!(detect_bam_features(records, 1000).unwrap()["NH"]);
     }
 
     #[test]
     fn feature_detection_honours_the_entry_limit() {
         // Python breaks on `n > n_entries`, so it examines n_entries + 1 reads.
-        let mut records = vec![record(&[(b"NH", 1)], false); 3];
-        records.push(record(&[], false));
-        assert!(detect_bam_features(&records, 2)["NH"]);
-        assert!(!detect_bam_features(&records, 3)["NH"]);
+        let records = || {
+            let mut v: Vec<Result<BamRecord>> =
+                (0..3).map(|_| Ok(bam(&[(b"NH", 1)], false))).collect();
+            v.push(Ok(bam(&[], false)));
+            v
+        };
+        assert!(detect_bam_features(records(), 2).unwrap()["NH"]);
+        assert!(!detect_bam_features(records(), 3).unwrap()["NH"]);
     }
 
     #[test]

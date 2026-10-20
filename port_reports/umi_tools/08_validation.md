@@ -269,18 +269,33 @@ Both are verified against the live interpreters in `core::mersenne`'s and
 
 ## Behavioural notes that are not deviations
 
-- **The output sort is in-memory.** `pysam.sort` shells out to `samtools sort`,
-  which spills to temporary files for inputs larger than memory;
-  `alignment::sort_output_to` holds the records in memory. For the
-  deduplicated output of a UMI-tools run — much smaller than its input — this
-  is not a practical limit, but it is a real difference for a very large
-  output.
+- **The output sort happens as records are written.** Python writes an
+  unsorted temporary file and then runs `samtools sort` on it;
+  `alignment::CoordinateSorter` sorts the records as they are produced, with
+  samtools' order (reference, position, strand, then input order), spilling
+  sorted runs of 256 MiB to `--temp-dir` and merging them. The output is the
+  same; the unsorted temporary file is never written.
 - **Log timestamps are UTC.** Python renders them in local time. The format is
   identical and the test harness strips these lines; taking a timezone
   dependency for a cosmetic log field was not worth it.
-- **`--output-stats` needs one pass, not two.** Python re-opens the BAM to
-  build the UMI frequency table for its null distribution; the records are
-  already in memory here. The resulting statistics files are byte-identical.
+- **Output headers are the input's text.** Python writes with the input as
+  `template`, which keeps each header line and its field order; SAM and BAM
+  output here is written from the input's header text too (sorted output with
+  `@HD` updated as `samtools sort` updates it), not re-serialised by `noodles`.
+  CRAM input and output still go through `noodles`' header.
+- **`--gene-transcript-map` transcript order.** Python keeps each gene's
+  transcripts in a `set`, so the order it reads them in — and with it which
+  reads `dedup` keeps and how `group` numbers its groups — changes with the
+  interpreter's hash seed from run to run. The port reads them in the map
+  file's order, one of Python's orders; outputs were compared with Python
+  run under a hash seed that gives that order. Like Python's `fetch(contig)`,
+  this needs a `.bai` or `.csi` index; `--chrom` uses one when present.
+- **The input is streamed, never held in memory.** Like Python, `dedup`
+  re-opens the input for the passes beside the main one — the multimapping
+  tag check, the `--output-stats` UMI frequency table, and
+  `TwoPassPairWriter`'s mate searches. The mate search per contig is a forward
+  scan of a second reader rather than an index lookup, which visits the same
+  records in the same order for a coordinate-sorted input.
 
 ## Release readiness
 

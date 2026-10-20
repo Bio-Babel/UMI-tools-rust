@@ -8,7 +8,7 @@
 //! real cells from background, and this command finds it.
 
 use std::collections::BTreeMap;
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use std::path::Path;
 
 use umi_tools_core::extract::{ExtractConfig, ExtractFilterAndUpdate, ExtractMethod};
@@ -21,6 +21,7 @@ use umi_tools_core::whitelist::{
 };
 use umi_tools_core::{PortError, Result};
 
+use crate::common;
 use crate::documentation;
 use crate::options::{self, OptionGroups};
 
@@ -342,7 +343,7 @@ pub fn main(args: &[String], argv: &[String]) -> Result<i32> {
         }
     }
 
-    let mut out = BufWriter::new(std::io::stdout());
+    let mut out = common::open_text_output(io.stdout.as_deref())?;
     let mut total_correct = 0u64;
     let mut total_corrected = 0u64;
 
@@ -398,7 +399,7 @@ pub fn main(args: &[String], argv: &[String]) -> Result<i32> {
             return Err(PortError::value(msg));
         }
     }
-    out.flush().map_err(io_error)?;
+    out.finish()?;
 
     utilities::info(&format!("Parsed {n_reads} reads"));
     utilities::info(&format!(

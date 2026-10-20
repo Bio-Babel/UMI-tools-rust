@@ -6,7 +6,7 @@
 //! `featureCounts -R CORE` produces. The input must be sorted by gene, because
 //! the count is a streaming group-by.
 
-use std::io::{BufWriter, Write};
+use std::io::Write;
 
 use umi_tools_core::network::UmiClusterer;
 use umi_tools_core::sam::{GeneCountTab, StringBarcodeGetter};
@@ -93,7 +93,7 @@ pub fn main(args: &[String], argv: &[String]) -> Result<i32> {
         None => Box::new(std::io::BufReader::new(std::io::stdin())),
     };
 
-    let mut out = BufWriter::new(std::io::stdout());
+    let mut out = common::open_text_output(io.stdout.as_deref())?;
     if per_cell {
         writeln!(out, "cell\tgene\tcount").map_err(common::io_error)?;
     } else {
@@ -129,7 +129,7 @@ pub fn main(args: &[String], argv: &[String]) -> Result<i32> {
             }
         }
     }
-    out.flush().map_err(common::io_error)?;
+    out.finish()?;
 
     let _ = n_input;
     utilities::info(&format!("Number of reads counted: {n_output}"));
